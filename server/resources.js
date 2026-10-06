@@ -42,21 +42,45 @@ function decorateProbe(data, probe) {
   });
 }
 
+function latestReleaseOf(data, batchId) {
+  const rows = data.releases.filter((r) => r.batchId === batchId);
+  return rows.length ? rows[rows.length - 1] : null;
+}
+
 function decorateBatch(data, batch) {
-  const stats = coldlib.excursionStats(data, batch.id);
   const check = coldlib.releaseCheck(data, batch);
   const releases = data.releases.filter((r) => r.batchId === batch.id);
+  const changes = coldlib.batchChangesOf(data, batch.id);
+  const currentProbe = batch.probeId ? data.probes.find((p) => p.id === batch.probeId) : null;
+  const latestRelease = latestReleaseOf(data, batch.id);
   return Object.assign({}, batch, {
     roomCode: roomCode(data, batch.roomId),
-    recordCount: stats.recordCount,
-    longestExcursionMinutes: stats.longestMinutes,
-    totalExcursionMinutes: stats.totalMinutes,
+    probeId: batch.probeId || '',
+    probeCode: currentProbe ? currentProbe.code : '',
+    changeCount: changes.length,
+    recordCount: check.recordCount,
+    longestExcursionMinutes: check.longestMinutes,
+    totalExcursionMinutes: check.totalMinutes,
     mkt: check.mkt,
     chainGapCount: check.chain.gapCount,
+    crossStintGapCount: check.chain.crossStintGapCount,
     expiredProbeCodes: check.expiredProbes.map((p) => p.probeCode),
     releaseCheck: check,
     releaseCount: releases.length,
     lastDecision: releases.length ? releases[releases.length - 1].decision : '',
+    // 已放行/拒收：当时判定用的是第几段口径，冻结在放行单上，不随后续变更重写
+    releaseBasis: latestRelease ? {
+      decidedAt: latestRelease.decidedAt,
+      decision: latestRelease.decision,
+      changeCount: latestRelease.changeCount || 0,
+      pass: latestRelease.pass,
+      mkt: latestRelease.mkt,
+      longestExcursionMinutes: latestRelease.longestExcursionMinutes,
+      totalExcursionMinutes: latestRelease.totalExcursionMinutes,
+      chainGapCount: latestRelease.chainGapCount,
+      stints: latestRelease.stints || [],
+      boundaryRule: latestRelease.boundaryRule || '',
+    } : null,
   });
 }
 
@@ -202,15 +226,22 @@ function listBatches(data, query) {
 function batchDetail(data, id) {
   const batch = data.batches.find((b) => b.id === id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  const plan = coldlib.stintPlan(data, batch);
   const rows = coldlib.recordsOfBatch(data, id).map((r) => Object.assign({}, r, {
     probeCode: probeCode(data, r.probeId),
     probeExpired: !coldlib.probeValidOn(coldlib.probeOf(data, r.probeId), String(r.at).slice(0, 10)),
+    stintIndex: coldlib.stintIndexAt(plan, r.at),
   }));
   return Object.assign({}, decorateBatch(data, batch), {
     records: rows,
     effectiveRecords: coldlib.effectiveRecords(data, id).map((r) => Object.assign({}, r, { probeCode: probeCode(data, r.probeId) })),
     segments: coldlib.excursionStats(data, id).segments,
     chainGaps: coldlib.chainGaps(data, id).gaps,
+    changes: coldlib.batchChangesOf(data, id).map((c) => coldlib.decorateChange(data, c)),
+    stints: coldlib.releaseCheck(data, batch).stints,
+    crossStintGaps: coldlib.releaseCheck(data, batch).chain.crossStintGaps,
+    comparison: coldlib.horizonComparison(data, batch),
+    boundaryRule: coldlib.BOUNDARY_RULE,
     releases: data.releases.filter((r) => r.batchId === id).slice().sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1)),
   });
 }
@@ -230,6 +261,9 @@ function validateBatch(data, payload, current) {
 
 function createBatch(data, payload) {
   validateBatch(data, payload, null);
+  if (payload.probeId && !data.probes.some((p) => p.id === payload.probeId)) {
+    throw new AppError(400, 'VALIDATION_FAILED', '有几项没通过校验', { probeId: '监测探头不存在' });
+  }
   const batch = {
     id: store.nextId('bt', data.batches),
     code: String(payload.code).trim(),
@@ -237,6 +271,7 @@ function createBatch(data, payload) {
     spec: String(payload.spec || '').trim(),
     units: Number(payload.units),
     roomId: payload.roomId,
+    probeId: payload.probeId || '',
     loadedAt: String(payload.loadedAt),
     supplier: String(payload.supplier || '').trim(),
     status: payload.status,
@@ -249,13 +284,19 @@ function createBatch(data, payload) {
 function updateBatch(data, id, payload) {
   const batch = data.batches.find((b) => b.id === id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  // 库位/设备归属不能直接改：必须走变更登记，留下从哪到哪、时刻、原因、经办人
+  if (payload.roomId !== undefined && String(payload.roomId) !== String(batch.roomId)) {
+    throw new AppError(400, 'USE_CHANGE_REGISTRATION', '换冷库/换车厢要在批次详情里登记变更，不能直接改所在冷库', { roomId: '请登记一条库位/设备变更' });
+  }
+  if (payload.probeId !== undefined && String(payload.probeId) !== String(batch.probeId || '')) {
+    throw new AppError(400, 'USE_CHANGE_REGISTRATION', '换探头要在批次详情里登记变更', { probeId: '请登记一条库位/设备变更' });
+  }
   validateBatch(data, payload, batch);
   const merged = Object.assign({}, batch, payload);
   Object.assign(batch, {
     product: String(merged.product).trim(),
     spec: String(merged.spec || '').trim(),
     units: Number(merged.units),
-    roomId: merged.roomId,
     loadedAt: String(merged.loadedAt),
     supplier: String(merged.supplier || '').trim(),
     status: merged.status,
@@ -271,8 +312,136 @@ function removeBatch(data, id) {
   const used = data.records.filter((r) => r.batchId === id).length;
   data.records = data.records.filter((r) => r.batchId !== id);
   data.releases = data.releases.filter((r) => r.batchId !== id);
+  data.batchChanges = (data.batchChanges || []).filter((c) => c.batchId !== id);
   data.batches = data.batches.filter((b) => b.id !== id);
   return { removed: id, removedRecords: used };
+}
+
+/* ===================== 库位/设备变更登记 ===================== */
+
+const TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+
+function validateBatchChange(data, batch, payload) {
+  const errors = {};
+  const changes = coldlib.batchChangesOf(data, batch.id);
+  const toRoomId = payload.toRoomId === undefined || payload.toRoomId === '' ? batch.roomId : String(payload.toRoomId);
+  // __keep / 未传：探头随批次沿用；也可以只换库位不换探头（便携探头随货走）
+  const toProbeId = payload.toProbeId === undefined || payload.toProbeId === '__keep'
+    ? (batch.probeId || '')
+    : String(payload.toProbeId || '');
+  if (!data.rooms.some((r) => r.id === toRoomId)) errors.toRoomId = '变更后的冷库/车厢不存在';
+  if (toProbeId && !data.probes.some((p) => p.id === toProbeId)) errors.toProbeId = '变更后的探头不存在';
+  if (!TIME_RE.test(String(payload.changedAt || ''))) errors.changedAt = '变更时刻格式要像 2026-09-01 08:00:00';
+  if (!String(payload.reason || '').trim()) errors.reason = '变更原因要填';
+  if (!String(payload.operator || '').trim()) errors.operator = '经办人要填';
+  const sameRoom = toRoomId === batch.roomId;
+  const sameProbe = toProbeId === (batch.probeId || '');
+  if (sameRoom && sameProbe) errors.toRoomId = '变更后的库位或设备要与当前不同';
+  if (!errors.changedAt && changes.length && String(payload.changedAt) <= changes[changes.length - 1].changedAt) {
+    errors.changedAt = '变更时刻要晚于上一条变更（' + changes[changes.length - 1].changedAt + '），变更只按时间顺序登记';
+  }
+  if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '这条变更没通过校验', errors);
+  return { toRoomId, toProbeId };
+}
+
+// 登记一次库位/设备变更：履历追加一条，批次当前归属同步更新；
+// 已放行/拒收的批次也允许补登记（事后补录换库事实），但当时的判定结论冻结在放行单上，不重算。
+function createBatchChange(data, batchId, payload) {
+  const batch = data.batches.find((b) => b.id === batchId);
+  if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  const form = validateBatchChange(data, batch, payload || {});
+  const beforeCheck = coldlib.releaseCheck(data, batch);
+  const change = {
+    id: store.nextId('bc', data.batchChanges || []),
+    batchId: batch.id,
+    changedAt: String(payload.changedAt),
+    fromRoomId: batch.roomId || '',
+    toRoomId: form.toRoomId,
+    fromProbeId: batch.probeId || '',
+    toProbeId: form.toProbeId,
+    reason: String(payload.reason).trim(),
+    operator: String(payload.operator).trim(),
+    remark: String(payload.remark || '').trim(),
+    registeredAt: store.nowText(),
+    decided: batch.status === '已放行' || batch.status === '已拒收',
+  };
+  data.batchChanges = data.batchChanges || [];
+  data.batchChanges.push(change);
+  batch.roomId = form.toRoomId;
+  if (form.toProbeId) batch.probeId = form.toProbeId;
+
+  const afterCheck = coldlib.releaseCheck(data, batch);
+  const released = latestReleaseOf(data, batch.id);
+  const response = {
+    change: coldlib.decorateChange(data, change),
+    batch: decorateBatch(data, batch),
+    before: compactCheckForCompare(beforeCheck),
+    after: compactCheckForCompare(afterCheck),
+    diff: compareChecks(beforeCheck, afterCheck),
+    releasedBasis: released ? frozenBasis(released) : null,
+    comparison: coldlib.horizonComparison(data, batch),
+  };
+  return response;
+}
+
+function compactCheckForCompare(check) {
+  return {
+    pass: check.pass,
+    failed: check.failed.slice(),
+    recordCount: check.recordCount,
+    longestMinutes: check.longestMinutes,
+    totalMinutes: check.totalMinutes,
+    monthTotalMinutes: check.monthTotalMinutes,
+    gapCount: check.chain.gapCount,
+    crossStintGapCount: check.chain.crossStintGapCount,
+    mkt: check.mkt,
+    changeCount: check.changeCount,
+    conditions: check.conditions.map((c) => ({ key: c.key, text: c.text, ok: c.ok, value: c.value, limit: c.limit })),
+  };
+}
+
+function compareChecks(before, after) {
+  const cond = [];
+  const map = {};
+  for (const c of before.conditions) map[c.key] = c;
+  for (const c of after.conditions) {
+    const p = map[c.key];
+    if (p && (p.ok !== c.ok || p.value !== c.value)) {
+      cond.push({ key: c.key, text: c.text, okChanged: p.ok !== c.ok, fromOk: p.ok, toOk: c.ok, fromValue: p.value, toValue: c.value });
+    }
+  }
+  return {
+    passChanged: before.pass !== after.pass,
+    fromPass: before.pass,
+    toPass: after.pass,
+    recordCountChanged: before.recordCount !== after.recordCount,
+    fromRecordCount: before.recordCount,
+    toRecordCount: after.recordCount,
+    conditions: cond,
+  };
+}
+
+function frozenBasis(release) {
+  return {
+    releaseId: release.id,
+    decision: release.decision,
+    decidedAt: release.decidedAt,
+    decider: release.decider,
+    changeCount: release.changeCount || 0,
+    pass: release.pass,
+    mkt: release.mkt,
+    longestExcursionMinutes: release.longestExcursionMinutes,
+    totalExcursionMinutes: release.totalExcursionMinutes,
+    chainGapCount: release.chainGapCount,
+    stints: release.stints || [],
+    boundaryRule: release.boundaryRule || '',
+  };
+}
+
+function listBatchChanges(data, batchId) {
+  const batch = data.batches.find((b) => b.id === batchId);
+  if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  return coldlib.batchChangesOf(data, batchId).map((c) => coldlib.decorateChange(data, c));
 }
 
 function listRecords(data, query) {
@@ -283,12 +452,23 @@ function listRecords(data, query) {
   if (q.source) rows = rows.filter((r) => r.source === q.source);
   if (q.from) rows = rows.filter((r) => r.at >= q.from);
   if (q.to) rows = rows.filter((r) => r.at <= q.to);
+  const plans = {};
   return rows
-    .map((r) => Object.assign({}, r, {
-      batchCode: batchCode(data, r.batchId),
-      probeCode: probeCode(data, r.probeId),
-      outOfRange: Number(r.temperatureC) > Number(data.settings.upperLimitC) || Number(r.temperatureC) < Number(data.settings.lowerLimitC),
-    }))
+    .map((r) => {
+      const batch = data.batches.find((b) => b.id === r.batchId);
+      let stintIndex = 0;
+      if (batch) {
+        if (!plans[r.batchId]) plans[r.batchId] = coldlib.stintPlan(data, batch);
+        stintIndex = coldlib.stintIndexAt(plans[r.batchId], r.at);
+      }
+      return Object.assign({}, r, {
+        batchCode: batchCode(data, r.batchId),
+        probeCode: probeCode(data, r.probeId),
+        outOfRange: Number(r.temperatureC) > Number(data.settings.upperLimitC) || Number(r.temperatureC) < Number(data.settings.lowerLimitC),
+        stintIndex,
+        stintRoomCode: batch ? roomCode(data, plans[r.batchId][stintIndex].roomId) : '',
+      });
+    })
     .sort((a, b) => (a.at < b.at ? 1 : -1));
 }
 
@@ -334,7 +514,17 @@ function listReleases(data, query) {
   if (q.batchId) rows = rows.filter((r) => r.batchId === q.batchId);
   if (q.decision) rows = rows.filter((r) => r.decision === q.decision);
   return rows
-    .map((r) => Object.assign({}, r, { batchCode: batchCode(data, r.batchId) }))
+    .map((r) => {
+      const currentChanges = coldlib.batchChangesOf(data, r.batchId).length;
+      const frozenChangeCount = r.changeCount || 0;
+      return Object.assign({}, r, {
+        batchCode: batchCode(data, r.batchId),
+        frozenPass: r.pass === undefined ? null : r.pass,
+        frozenChangeCount: frozenChangeCount,
+        stintCount: (r.stints || []).length,
+        laterChangeCount: Math.max(0, currentChanges - frozenChangeCount),
+      });
+    })
     .sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1));
 }
 
@@ -359,6 +549,24 @@ function decide(data, batchId, payload) {
     longestExcursionMinutes: check.longestMinutes,
     totalExcursionMinutes: check.totalMinutes,
     chainGapCount: check.chain.gapCount,
+    // 冻结当时用的分段口径：前几段、每段库位/探头/记录数/超限/断链；之后补登记变更不重写
+    pass: check.pass,
+    changeCount: check.changeCount,
+    boundaryRule: coldlib.BOUNDARY_RULE,
+    stints: check.stints.map((s) => ({
+      index: s.index,
+      startAt: s.startAt,
+      endAt: s.endAt,
+      roomId: s.roomId,
+      roomCode: s.roomCode,
+      probeId: s.probeId,
+      probeCode: s.probeCode,
+      recordCount: s.recordCount,
+      longestMinutes: s.longestMinutes,
+      totalMinutes: s.totalMinutes,
+      gapCount: s.gapCount,
+      mkt: s.mkt,
+    })),
     basis: String(payload.basis || '').trim(),
     remark: String(payload.remark || ''),
   };
@@ -372,6 +580,7 @@ module.exports = {
   listRooms, roomDetail, createRoom, updateRoom, removeRoom,
   listProbes, createProbe, updateProbe, removeProbe,
   listBatches, batchDetail, createBatch, updateBatch, removeBatch,
+  createBatchChange, listBatchChanges,
   listRecords, createRecord, removeRecord,
   listReleases, decide,
   ROOM_STATUS, ROOM_TYPE, PROBE_STATUS, BATCH_STATUS, SOURCE_LIST,

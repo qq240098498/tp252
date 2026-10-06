@@ -369,10 +369,11 @@ function renderBatchRows() {
   const rows = state.batchesView || [];
   const tbody = $('batchRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="13" class="empty">没有符合条件的批次</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">没有符合条件的批次</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function (b) {
+    const historyPill = num(b.changeCount) > 0 ? pill('变更 ' + b.changeCount + ' 次', 'pill-mute') : '—';
     const main = '<tr class="row-main" data-rowkind="batch" data-id="' + esc(b.id) + '">' +
       '<td>' + esc(b.code) + '</td>' +
       '<td>' + esc(b.product) + '</td>' +
@@ -386,6 +387,7 @@ function renderBatchRows() {
       '<td class="num">' + num(b.totalExcursionMinutes) + '</td>' +
       '<td class="num">' + num(b.mkt) + '</td>' +
       '<td class="num">' + num(b.chainGapCount) + '</td>' +
+      '<td>' + historyPill + '</td>' +
       '<td>' + releaseSituation(b) + '</td>' +
       '</tr>';
     if (!state.expandedBatches.has(b.id)) return main;
@@ -393,18 +395,131 @@ function renderBatchRows() {
   }).join('');
 }
 
+function stintTag(stintIndex, stints) {
+  const s = (stints || []).find(function (x) { return num(x.index) === num(stintIndex); });
+  if (!s) return '段' + (num(stintIndex) + 1);
+  return esc('段' + (num(s.index) + 1) + ' ' + s.roomCode + ' / ' + s.probeCode);
+}
+
+function changeKindText(ch) {
+  const roomChanged = !!ch.fromRoomCode || !!ch.toRoomCode;
+  const probeChanged = !!ch.fromProbeCode || !!ch.toProbeCode;
+  if (roomChanged && probeChanged) return '换库位·换设备';
+  if (probeChanged) return '换设备';
+  return '换库位';
+}
+
+function changeHistoryBlock(b, d) {
+  const changes = d.changes || [];
+  const rows = changes.map(function (c) {
+    return '<tr>' +
+      '<td>' + esc(c.changedAt) + '</td>' +
+      '<td>' + esc(changeKindText(c)) + '</td>' +
+      '<td>' + esc((c.fromRoomCode || '—') + (c.fromProbeCode ? ' / ' + c.fromProbeCode : '')) + '</td>' +
+      '<td>' + esc((c.toRoomCode || '—') + (c.toProbeCode ? ' / ' + c.toProbeCode : '')) + '</td>' +
+      '<td>' + esc(c.reason) + '</td>' +
+      '<td>' + esc(c.operator) + '</td>' +
+      '<td>' + (c.decided ? pill('放行后补登', 'pill-mute') : pill('判定前', 'pill-ok')) + '</td>' +
+      '<td>' + esc(c.registeredAt || '') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">还没有登记过变更；批次自入库起一直在同一库位、同一设备</td></tr>';
+  const rule = '<div class="field-hint">口径：' + esc(d.boundaryRule || '') + '</div>';
+  const btn = '<div class="detail-actions"><button type="button" class="btn btn-primary" data-action="batch-change" data-id="' + esc(b.id) + '">登记库位/设备变更</button></div>';
+  return '<div class="detail-block detail-block-wide"><h4>变更履历（' + changes.length + '）</h4>' +
+    '<table class="mini-table"><thead><tr><th>变更时刻</th><th>类型</th><th>从</th><th>到</th><th>原因</th><th>经办人</th><th>登记时机</th><th>登记时刻</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    rule + btn + '</div>';
+}
+
+function stintBlocks(b, d) {
+  const stints = d.stints || [];
+  const rows = stints.map(function (s) {
+    return '<tr>' +
+      '<td>段' + (num(s.index) + 1) + '</td>' +
+      '<td>' + esc(s.startAt) + '<br><span class="cond-meta">至 ' + esc(s.endAt || '现在') + '</span></td>' +
+      '<td>' + esc(s.roomCode + ' ' + (s.roomName || '')) + (s.roomMissing ? ' ' + pill('已删除', 'pill-bad') : '') + '</td>' +
+      '<td>' + esc(s.probeCode || '未指定探头') + (s.probeMissing ? ' ' + pill('已删除', 'pill-bad') : '') + '</td>' +
+      '<td class="num">' + num(s.recordCount) + '</td>' +
+      '<td class="num">' + num(s.longestMinutes) + '</td>' +
+      '<td class="num">' + num(s.totalMinutes) + '</td>' +
+      '<td class="num">' + num(s.gapCount) + '</td>' +
+      '<td class="num">' + num(s.mkt) + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="9" class="empty">没有分段</td></tr>';
+  let cross = '<tr><td colspan="5" class="empty">段间交接处没有超过断链门槛的缺口</td></tr>';
+  const crossGaps = d.crossStintGaps || [];
+  if (crossGaps.length) {
+    cross = crossGaps.map(function (g) {
+      return '<tr><td>段' + (num(g.fromStint) + 1) + ' ' + esc(g.fromRoomCode + '/' + g.fromProbeCode) + ' → 段' + (num(g.toStint) + 1) + ' ' + esc(g.toRoomCode + '/' + g.toProbeCode) + '</td>' +
+        '<td>' + esc(g.from) + '</td><td>' + esc(g.to) + '</td><td class="num">' + num(g.minutes) + '</td>' +
+        '<td>' + pill('换链缺口·不计断链', 'pill-mute') + '</td></tr>';
+    }).join('');
+  }
+  return '<div class="detail-block detail-block-wide"><h4>分段归属与每段统计（' + stints.length + ' 段；口径随变更登记切换）</h4>' +
+    '<table class="mini-table"><thead><tr><th>段</th><th>时段</th><th>冷库/车厢</th><th>设备</th><th class="num">记录数</th><th class="num">最长超限(分)</th><th class="num">累计超限(分)</th><th class="num">段内断链</th><th class="num">MKT</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    '<h4>换链缺口（' + crossGaps.length + '，段间交接，不计断链）</h4>' +
+    '<table class="mini-table"><thead><tr><th>交接</th><th>起</th><th>止</th><th class="num">实际(分)</th><th>口径</th></tr></thead><tbody>' + cross + '</tbody></table></div>';
+}
+
+const COND_LABEL = { longest: '单次最长超限', total: '累计超限', chain: '断链', calibration: '探头校准' };
+
+function comparisonBlock(b, d) {
+  const items = d.comparison || [];
+  const rows = items.map(function (it) {
+    const tag = it.changeCount === 0
+      ? '登记前（旧口径，整段不分段）'
+      : '第 ' + it.changeCount + ' 次变更后 · ' + it.change.changedAt + ' ' + it.change.toRoomCode + '/' + it.change.toProbeCode;
+    const c = it.check;
+    let flip = '—';
+    if (it.diff && it.diff.conditions.length) {
+      flip = it.diff.conditions.map(function (x) {
+        const head = esc(COND_LABEL[x.key] || x.key);
+        if (x.okChanged) return head + '：' + (x.fromOk ? '满足→不满足' : '不满足→满足') + '（' + num(x.fromValue) + '→' + num(x.toValue) + '）';
+        return head + '：数值变化 ' + num(x.fromValue) + '→' + num(x.toValue) + '，结论仍' + (x.toOk ? '满足' : '不满足');
+      }).join('<br>');
+    }
+    const caused = it.change ? ('由「' + esc(it.change.reason) + '」这次变更导致') : '';
+    return '<tr' + (it.diff && it.diff.passChanged ? ' class="row-danger"' : '') + '>' +
+      '<td>' + esc(tag) + (it.change ? '<div class="cond-meta">' + caused + '</div>' : '') + '</td>' +
+      '<td class="num">' + num(c.recordCount) + '</td>' +
+      '<td class="num">' + num(c.longestMinutes) + '</td>' +
+      '<td class="num">' + num(c.totalMinutes) + '</td>' +
+      '<td class="num">' + num(c.gapCount) + '</td>' +
+      '<td>' + (c.pass ? pill('满足', 'pill-ok') : pill('不满足', 'pill-bad')) + '</td>' +
+      '<td>' + flip + (it.diff && it.diff.passChanged ? '<div class="cond-meta">放行结论翻转：' + (it.diff.fromPass ? '满足→不满足' : '不满足→满足') + '</div>' : '') + '</td>' +
+      '</tr>';
+  }).join('');
+  let frozen = '';
+  const basis = d.releaseBasis;
+  if (basis) {
+    const frozenStints = (basis.stints || []).map(function (s) {
+      return '段' + (num(s.index) + 1) + ' ' + esc(s.roomCode + '/' + s.probeCode) + '（' + num(s.recordCount) + ' 条，最长超限 ' + num(s.longestMinutes) + '，断链 ' + num(s.gapCount) + '）';
+    }).join('；');
+    frozen = '<div class="freeze-note">' +
+      '<h4>当时判定依据（已冻结，不按新归属重新解释）</h4>' +
+      '<div>' + esc(basis.decision) + ' 于 ' + esc(basis.decidedAt) + ' 由 ' + esc(basis.decider) + ' 登记，当时按前 ' + num(basis.changeCount) + ' 次变更的 ' + ((basis.stints || []).length || 1) + ' 段口径判定，结论 ' +
+      (basis.pass ? pill('满足放行条件', 'pill-ok') : pill('不满足放行条件', 'pill-bad')) + '（MKT ' + num(basis.mkt) + '，最长超限 ' + num(basis.longestExcursionMinutes) + '，累计 ' + num(basis.totalExcursionMinutes) + '，断链 ' + num(basis.chainGapCount) + '）。</div>' +
+      (frozenStints ? '<div class="cond-meta">' + frozenStints + '</div>' : '') +
+      '<div class="cond-meta">边界口径：' + esc(basis.boundaryRule || d.boundaryRule || '') + '</div>' +
+      '<div class="cond-meta">放行之后又补登了 ' + num((d.changes || []).filter(function (c) { return c.decided; }).length) + ' 次变更，只影响上面“当前口径”的统计与今后的判定，不改变这张放行单。</div>' +
+      '</div>';
+  }
+  return '<div class="detail-block detail-block-wide"><h4>判定口径对照（每登记一次变更，哪些结论变了、由哪次变更导致）</h4>' +
+    '<table class="mini-table"><thead><tr><th>口径阶段</th><th class="num">记录数</th><th class="num">最长超限</th><th class="num">累计超限</th><th class="num">段内断链</th><th>放行条件</th><th>相对上一步的变化</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    frozen + '</div>';
+}
+
 function batchDetailRow(b) {
   const d = state.batchDetail[b.id];
-  if (!d) return '<tr class="row-detail"><td colspan="13"><div class="detail-note">正在读取批次详情…</div></td></tr>';
+  if (!d) return '<tr class="row-detail"><td colspan="14"><div class="detail-note">正在读取批次详情…</div></td></tr>';
   const out = state.batchOut[b.id] || {};
 
   const records = (d.records || []).map(function (r) {
     const oor = out[r.id];
-    return '<tr><td>' + esc(r.at) + '</td><td>' + esc(r.probeCode) + '</td><td class="num">' + num(r.temperatureC) + '</td>' +
+    return '<tr><td>' + esc(r.at) + '</td><td>' + esc(r.probeCode) + '</td><td>' + stintTag(r.stintIndex, d.stints) + '</td><td class="num">' + num(r.temperatureC) + '</td>' +
       '<td>' + esc(r.source) + '</td>' +
       '<td>' + (oor ? pill('超限', 'pill-bad') : pill('正常', 'pill-mute')) + '</td>' +
       '<td>' + (r.probeExpired ? pill('已过期', 'pill-bad') : pill('有效', 'pill-mute')) + '</td></tr>';
-  }).join('') || '<tr><td colspan="6" class="empty">没有温度记录</td></tr>';
+  }).join('') || '<tr><td colspan="7" class="empty">没有温度记录</td></tr>';
 
   let segmentsHtml;
   if (d.segmentsUnavailable) {
@@ -429,7 +544,7 @@ function batchDetailRow(b) {
   conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
   const condHtml = conds.map(function (c) {
     return '<li><span class="cond-text">' + okPill(c.ok) + ' ' + esc(c.text) + '</span>' +
-      '<span class="cond-meta">实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '</span></li>';
+      '<span class="cond-meta">实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '（当前口径：前 ' + num(check.changeCount || 0) + ' 次变更，' + ((check.stints || []).length || 1) + ' 段）</span></li>';
   }).join('');
 
   const expiredProbes = expired.map(function (p) {
@@ -437,8 +552,11 @@ function batchDetailRow(b) {
   }).join('') || '<tr><td colspan="3" class="empty">没有已过校准期的探头</td></tr>';
 
   const releases = (d.releases || []).map(function (r) {
+    const scope = typeof r.changeCount === 'number'
+      ? '<div class="cond-meta">按前 ' + num(r.changeCount) + ' 次变更、' + ((r.stints || []).length || 1) + ' 段口径判定' + (r.pass === false ? '；当时判定不满足条件仍手工' + esc(r.decision) : '') + '</div>'
+      : '';
     return '<tr><td>' + esc(r.decision) + '</td><td>' + esc(r.decidedAt) + '</td><td>' + esc(r.decider) + '</td>' +
-      '<td class="num">' + num(r.mkt) + '</td><td>' + esc(r.basis) + '</td></tr>';
+      '<td class="num">' + num(r.mkt) + '</td><td>' + esc(r.basis) + scope + '</td></tr>';
   }).join('') || '<tr><td colspan="5" class="empty">没有放行记录</td></tr>';
 
   const decisionBtns = '<div class="detail-actions">' +
@@ -447,14 +565,17 @@ function batchDetailRow(b) {
     '<button type="button" class="btn btn-danger" data-action="batch-del" data-id="' + esc(b.id) + '">删除</button>' +
     '</div>';
 
-  return '<tr class="row-detail"><td colspan="13">' +
+  return '<tr class="row-detail"><td colspan="14">' +
     '<div class="detail-grid">' +
+    changeHistoryBlock(b, d) +
+    stintBlocks(b, d) +
+    comparisonBlock(b, d) +
     '<div class="detail-block"><h4>温度记录（' + (d.records || []).length + '）</h4>' +
-    '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
-    '<div class="detail-block"><h4>超限段（' + (d.segments || []).length + '）</h4>' + segmentsHtml +
-    '<h4>断链缺口（' + (d.chainGaps || []).length + '）</h4>' +
+    '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th>归属段</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
+    '<div class="detail-block"><h4>超限段·整批参考（' + (d.segments || []).length + '）</h4>' + segmentsHtml +
+    '<h4>断链缺口·整批参考（' + (d.chainGaps || []).length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>起</th><th>止</th><th class="num">实际(分)</th><th class="num">计入(分)</th></tr></thead><tbody>' + gaps + '</tbody></table></div>' +
-    '<div class="detail-block"><h4>放行判定</h4><ul class="cond-list">' + condHtml + '</ul>' +
+    '<div class="detail-block"><h4>放行判定（当前口径）</h4><ul class="cond-list">' + condHtml + '</ul>' +
     '<h4>已过校准期的探头（' + expired.length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>探头</th><th>校准有效期</th><th>记录时刻</th></tr></thead><tbody>' + expiredProbes + '</tbody></table></div>' +
     '<div class="detail-block"><h4>放行记录（' + (d.releases || []).length + '）</h4>' +
@@ -498,6 +619,11 @@ async function expandBatch(id) {
         chainGaps: (check.chain && check.chain.gaps) || [],
         releases: fallback[2] || [],
         releaseCheck: check,
+        changes: base && base.releaseBasis ? [] : [],
+        stints: check.stints || [],
+        crossStintGaps: (check.chain && check.chain.crossStintGaps) || [],
+        comparison: [],
+        boundaryRule: check.boundaryRule || '',
         __fallback: true
       });
     }
@@ -530,7 +656,7 @@ async function loadRecordsView() {
     : ('共 ' + rows.length + ' 条，已显示前 ' + Math.min(RECORD_PAGE, rows.length) + ' 条');
   const tbody = $('recordRows');
   if (!shown.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">没有符合条件的温度记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">没有符合条件的温度记录</td></tr>';
     return;
   }
   tbody.innerHTML = shown.map(function (r) {
@@ -538,6 +664,7 @@ async function loadRecordsView() {
       '<td>' + esc(r.batchCode) + '</td>' +
       '<td>' + esc(r.probeCode) + '</td>' +
       '<td>' + esc(r.at) + '</td>' +
+      '<td>段' + (num(r.stintIndex) + 1) + (r.stintRoomCode ? ' ' + esc(r.stintRoomCode) : '') + '</td>' +
       '<td class="num">' + num(r.temperatureC) + '</td>' +
       '<td>' + esc(r.source) + '</td>' +
       '<td>' + esc(r.operator) + '</td>' +
@@ -570,10 +697,18 @@ async function loadReleasesView() {
   }
   const tbody = $('releaseRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有符合条件的放行记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">没有符合条件的放行记录</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function (r) {
+    let basis;
+    if (typeof r.frozenChangeCount === 'number') {
+      basis = pill('按 ' + ((r.stintCount || 1)) + ' 段（前 ' + num(r.frozenChangeCount) + ' 次变更）判定', 'pill-mute') +
+        (r.frozenPass === false ? ' ' + pill('当时判定不满足', 'pill-bad') : r.frozenPass === true ? ' ' + pill('当时判定满足', 'pill-ok') : '');
+      if (num(r.laterChangeCount) > 0) basis += '<div class="cond-meta">放行后又登记 ' + num(r.laterChangeCount) + ' 次变更，本单结论不重算</div>';
+    } else {
+      basis = '<span class="cond-meta">旧版放行单，未分段</span>';
+    }
     return '<tr class="row-main" data-rowkind="release" data-id="' + esc(r.id) + '">' +
       '<td>' + esc(r.batchCode) + '</td>' +
       '<td>' + (r.decision === '放行' ? pill('放行', 'pill-ok') : pill('拒收', 'pill-bad')) + '</td>' +
@@ -583,6 +718,7 @@ async function loadReleasesView() {
       '<td class="num">' + num(r.longestExcursionMinutes) + '</td>' +
       '<td class="num">' + num(r.totalExcursionMinutes) + '</td>' +
       '<td class="num">' + num(r.chainGapCount) + '</td>' +
+      '<td>' + basis + '</td>' +
       '<td>' + esc(r.basis) + '</td>' +
       '<td>' + esc(r.remark) + '</td>' +
       '</tr>';
@@ -756,6 +892,65 @@ function openDecisionModal(batch, decision) {
   });
 }
 
+function openBatchChangeForm(batch) {
+  const currentRoom = batch.roomId || (state.batches.find(function (x) { return x.id === batch.id; }) || {}).roomId || '';
+  const currentProbe = batch.probeId || (state.batches.find(function (x) { return x.id === batch.id; }) || {}).probeId || '';
+  const decided = batch.status === '已放行' || batch.status === '已拒收';
+  const roomOpts = state.rooms.map(function (r) {
+    return '<option value="' + esc(r.id) + '"' + (r.id === currentRoom ? ' selected' : '') + '>' + esc(r.code + ' ' + r.name + '（' + r.type + '）') + '</option>';
+  }).join('');
+  const probeOpts = '<option value="__keep">探头随批次沿用（不换设备）</option>' +
+    '<option value="">未指定探头</option>' +
+    state.probes.map(function (p) {
+      return '<option value="' + esc(p.id) + '"' + (p.id === currentProbe ? ' selected' : '') + '>' + esc(p.code + '（' + (p.roomCode || '') + ' ' + (p.position || '') + '）') + '</option>';
+    }).join('');
+  const warn = decided
+    ? '<div class="field-hint freeze-hint">这个批次已' + esc(batch.status) + '：补登记只影响今后判定与统计，当时的判定依据已冻结，不会按新归属重新解释。</div>'
+    : '';
+  const body =
+    warn +
+    '<div class="field"><label>变更后冷库/车厢</label><select data-field="toRoomId">' + roomOpts + '</select></div>' +
+    '<div class="field"><label>变更后探头</label><select data-field="toProbeId">' + probeOpts + '</select></div>' +
+    '<div class="field"><label>变更时刻</label><input type="text" data-field="changedAt" value="" placeholder="2026-09-01 08:00:00"><div class="field-hint">边界口径：整刻起的记录计入新段（例如 08:00 换车，08:00 的记录算新车）。只能晚于上一条变更。</div></div>' +
+    '<div class="field"><label>变更原因</label><input type="text" data-field="reason" value="" placeholder="如：转入 2 号库 / 装车发运 / 探头故障更换"></div>' +
+    '<div class="field"><label>经办人</label><input type="text" data-field="operator" value=""></div>' +
+    '<div class="field"><label>备注</label><textarea data-field="remark"></textarea></div>';
+  openModal('登记库位/设备变更', body, '登记', async function () {
+    const v = formValues();
+    try {
+      const result = await api('POST', '/api/batches/' + encodeURIComponent(batch.id) + '/changes', {
+        toRoomId: v.toRoomId,
+        toProbeId: v.toProbeId,
+        changedAt: v.changedAt,
+        reason: v.reason,
+        operator: v.operator,
+        remark: v.remark
+      });
+      closeModal();
+      delete state.batchDetail[batch.id];
+      delete state.batchOut[batch.id];
+      await refreshAfterMutation();
+      reportChangeImpact(result);
+    } catch (err) { showError(err); }
+  });
+}
+
+function reportChangeImpact(result) {
+  const d = result.diff;
+  if (!d) return;
+  const labels = { longest: '单次最长超限', total: '累计超限', chain: '断链' };
+  if (d.conditions.length) {
+    const parts = d.conditions.map(function (c) {
+      const head = labels[c.key] || c.key;
+      if (c.okChanged) return head + '：' + (c.fromOk ? '满足→不满足' : '不满足→满足') + '（' + c.fromValue + '→' + c.toValue + '）';
+      return head + '：' + c.fromValue + '→' + c.toValue + '，结论未变';
+    });
+    showError({ message: '变更已登记。判定对照：' + parts.join('；') + (d.passChanged ? '；放行条件整体' + (d.toPass ? '转为满足' : '转为不满足') : '；放行条件整体结论未变') });
+  } else if (d.recordCountChanged) {
+    showError({ message: '变更已登记。参与判定记录数 ' + d.fromRecordCount + '→' + d.toRecordCount + '，各项判定条件结论未变。' });
+  }
+}
+
 function openRecordForm() {
   const now = state.summary && state.summary.today ? state.summary.today + ' 00:00:00' : '';
   const body =
@@ -874,6 +1069,11 @@ async function handleAction(action, el) {
     if (action === 'batch-release' || action === 'batch-reject') {
       const batch = findBatch(el.dataset.id);
       if (batch) openDecisionModal(batch, action === 'batch-release' ? '放行' : '拒收');
+      return;
+    }
+    if (action === 'batch-change') {
+      const batch = findBatch(el.dataset.id);
+      if (batch) openBatchChangeForm(batch);
       return;
     }
     if (action === 'batch-del') {

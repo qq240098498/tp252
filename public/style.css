@@ -216,13 +216,18 @@ button { font-family: inherit; font-size: 13px; }
 tr.row-detail > td { background: #f7fbfc; border-bottom: 1px solid var(--line); }
 .detail-note { color: var(--ink-soft); font-size: 12px; margin: 2px 0 8px; }
 .detail-grid { display: flex; flex-wrap: wrap; gap: 14px; }
-.detail-block { flex: 1 1 320px; min-width: 280px; }
+.detail-block { flex: 1 1 320px; min-width: 280px; overflow-x: auto; }
+.detail-block-wide { flex: 1 1 100%; min-width: 0; }
 .detail-block h4 { margin: 6px 0 6px; font-size: 13px; color: var(--primary-dark); }
 .detail-block table { margin-bottom: 8px; }
 .mini-table { border-collapse: collapse; width: 100%; background: #fff; border: 1px solid var(--line-soft); border-radius: 4px; }
 .mini-table th, .mini-table td { padding: 4px 8px; border-bottom: 1px solid var(--line-soft); text-align: left; white-space: nowrap; }
 .mini-table th { background: #f1f8fa; color: var(--primary-dark); }
 .detail-actions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+.freeze-note { margin-top: 8px; padding: 8px 10px; border: 1px solid #a9d8c4; border-left: 3px solid var(--ok); background: var(--ok-soft); border-radius: 6px; }
+.freeze-note h4 { margin: 0 0 4px; color: var(--ok); }
+.freeze-note > div { font-size: 12px; line-height: 1.7; }
+.freeze-hint { color: var(--accent); }
 
 .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); background: #fff; }
 .pill-ok { color: var(--ok); border-color: #a9d8c4; background: var(--ok-soft); }

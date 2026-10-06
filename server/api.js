@@ -103,8 +103,17 @@ router.delete('/batches/:id', withData((data, req) => ({ __save: true, __body: r
 router.get('/batches/:id/release-check', withData((data, req) => {
   const batch = data.batches.find((b) => b.id === req.params.id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
-  return coldlib.releaseCheck(data, batch);
+  // ?k= 只算前 k 次变更的口径，用于对照（k=0 是尚未登记变更时的旧口径）；默认全部
+  const options = {};
+  if (req.query.k !== undefined) {
+    const k = Number(req.query.k);
+    if (!Number.isInteger(k) || k < 0) throw new AppError(400, 'VALIDATION_FAILED', 'k 要是非负整数', { k: 'k 要是非负整数' });
+    options.k = k;
+  }
+  return coldlib.releaseCheck(data, batch, options);
 }));
+router.get('/batches/:id/changes', withData((data, req) => res.listBatchChanges(data, req.params.id)));
+router.post('/batches/:id/changes', withData((data, req) => ({ __save: true, __body: res.createBatchChange(data, req.params.id, req.body || {}) })));
 router.post('/batches/:id/decision', withData((data, req) => ({ __save: true, __body: res.decide(data, req.params.id, req.body || {}) })));
 
 router.get('/records', withData((data, req) => res.listRecords(data, req.query)));

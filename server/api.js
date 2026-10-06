@@ -65,13 +65,15 @@ function overview(data) {
     },
     rooms: data.rooms.map((r) => {
       const probes = data.probes.filter((p) => p.roomId === r.id);
-      const batches = data.batches.filter((b) => b.roomId === r.id);
+      const batches = data.batches.filter((b) => coldlib.roomIdAt(data, b, store.nowText()) === r.id);
       return {
         id: r.id, code: r.code, name: r.name, type: r.type, status: r.status,
         probeCount: probes.length, batchCount: batches.length,
         openBatchCount: batches.filter((b) => b.status === '在库' || b.status === '待放行').length,
       };
     }),
+    changeCount: (data.changes || []).length,
+    affectedChangeCount: (data.changes || []).filter((c) => Array.isArray(c.impact) && c.impact.some((x) => x.conclusionChanged)).length,
   };
 }
 
@@ -103,8 +105,14 @@ router.delete('/batches/:id', withData((data, req) => ({ __save: true, __body: r
 router.get('/batches/:id/release-check', withData((data, req) => {
   const batch = data.batches.find((b) => b.id === req.params.id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
-  return coldlib.releaseCheck(data, batch);
+  return coldlib.releaseCheckAt(data, batch, req.query.asOf || null);
 }));
+router.get('/batches/:id/changes', withData((data, req) => {
+  const batch = data.batches.find((b) => b.id === req.params.id);
+  if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  return res.listChanges(data, { batchId: req.params.id });
+}));
+router.post('/batches/:id/changes', withData((data, req) => ({ __save: true, __body: res.registerChange(data, req.params.id, req.body || {}) })));
 router.post('/batches/:id/decision', withData((data, req) => ({ __save: true, __body: res.decide(data, req.params.id, req.body || {}) })));
 
 router.get('/records', withData((data, req) => res.listRecords(data, req.query)));
@@ -112,6 +120,7 @@ router.post('/records', withData((data, req) => ({ __save: true, __body: res.cre
 router.delete('/records/:id', withData((data, req) => ({ __save: true, __body: res.removeRecord(data, req.params.id) })));
 
 router.get('/releases', withData((data, req) => res.listReleases(data, req.query)));
+router.get('/changes', withData((data, req) => res.listChanges(data, req.query)));
 
 router.use((req, r, next) => next(new AppError(404, 'NOT_FOUND', '这个地址没有对应功能：' + req.method + ' ' + req.originalUrl)));
 

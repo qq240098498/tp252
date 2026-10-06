@@ -320,3 +320,30 @@ tr.row-detail > td { background: #f7fbfc; border-bottom: 1px solid var(--line); 
   .layout { flex-direction: column; }
   .filters { width: 100%; flex: 1 1 auto; position: static; }
 }
+
+/* 库位变更与分段 */
+.detail-block-wide { flex: 1 1 100%; min-width: 0; overflow-x: auto; }
+.detail-block-wide .mini-table { min-width: 720px; }
+.seg-current td { background: #f3faf6; }
+.seg-cond {
+  display: inline-block; width: 18px; height: 18px; line-height: 18px;
+  text-align: center; border-radius: 50%; font-size: 12px; font-weight: 700;
+}
+.seg-cond-ok { color: var(--ok); background: var(--ok-soft); }
+.seg-cond-bad { color: var(--accent); background: var(--accent-soft); }
+.frozen-note {
+  margin: 8px 0; padding: 7px 10px; border-radius: 5px;
+  border: 1px solid #e7c890; background: #fdf6e7; color: #8a5a12; font-size: 13px;
+}
+.muted { color: var(--ink-soft); font-size: 12px; }
+.muted-row td { color: var(--ink-soft); }
+.moved-mark { color: var(--primary); font-weight: 700; }
+.field-readonly {
+  padding: 5px 7px; border: 1px dashed var(--line); border-radius: 4px;
+  background: #f7fafb; color: var(--ink); font-size: 13px;
+}
+.rule-list { margin: 0; padding: 0 22px; color: var(--ink-soft); line-height: 1.9; }
+.rule-list b { color: var(--ink); }
+.result-block h4 { margin: 10px 0 4px; font-size: 13px; color: var(--primary-dark); }
+.result-block > div { margin-bottom: 6px; }
+#modalBody .frozen-note:last-child { margin-bottom: 0; }

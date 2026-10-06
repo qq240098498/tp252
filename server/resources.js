@@ -23,12 +23,12 @@ function probeCode(data, id) {
 
 function decorateRoom(data, room) {
   const probes = data.probes.filter((p) => p.roomId === room.id);
-  const batches = data.batches.filter((b) => b.roomId === room.id);
+  const here = data.batches.filter((b) => coldlib.roomIdAt(data, b, store.nowText()) === room.id);
   return Object.assign({}, room, {
     probeCount: probes.length,
     runningProbeCount: probes.filter((p) => p.status === '在用').length,
-    batchCount: batches.length,
-    openBatchCount: batches.filter((b) => b.status === '在库' || b.status === '待放行').length,
+    batchCount: here.length,
+    openBatchCount: here.filter((b) => b.status === '在库' || b.status === '待放行').length,
   });
 }
 
@@ -46,8 +46,12 @@ function decorateBatch(data, batch) {
   const stats = coldlib.excursionStats(data, batch.id);
   const check = coldlib.releaseCheck(data, batch);
   const releases = data.releases.filter((r) => r.batchId === batch.id);
+  const timeline = coldlib.locationTimeline(data, batch);
+  const currentRoomId = coldlib.roomIdAt(data, batch, store.nowText());
   return Object.assign({}, batch, {
-    roomCode: roomCode(data, batch.roomId),
+    roomId: currentRoomId,
+    roomCode: roomCode(data, currentRoomId),
+    registeredRoomId: batch.roomId,
     recordCount: stats.recordCount,
     longestExcursionMinutes: stats.longestMinutes,
     totalExcursionMinutes: stats.totalMinutes,
@@ -57,6 +61,8 @@ function decorateBatch(data, batch) {
     releaseCheck: check,
     releaseCount: releases.length,
     lastDecision: releases.length ? releases[releases.length - 1].decision : '',
+    changeCount: timeline.changes.length,
+    lastChangeAt: timeline.changes.length ? timeline.changes[timeline.changes.length - 1].changedAt : '',
   });
 }
 
@@ -77,7 +83,7 @@ function roomDetail(data, id) {
   if (!room) throw new AppError(404, 'ROOM_NOT_FOUND', '这个冷库或者车厢不存在');
   return Object.assign({}, decorateRoom(data, room), {
     probes: data.probes.filter((p) => p.roomId === id).map((p) => decorateProbe(data, p)),
-    batches: data.batches.filter((b) => b.roomId === id).map((b) => decorateBatch(data, b)),
+    batches: data.batches.filter((b) => coldlib.roomIdAt(data, b, store.nowText()) === id).map((b) => decorateBatch(data, b)),
   });
 }
 
@@ -126,8 +132,12 @@ function updateRoom(data, id, payload) {
 function removeRoom(data, id) {
   const room = data.rooms.find((r) => r.id === id);
   if (!room) throw new AppError(404, 'ROOM_NOT_FOUND', '这个冷库或者车厢不存在');
-  const used = data.probes.filter((p) => p.roomId === id).length + data.batches.filter((b) => b.roomId === id).length;
-  if (used > 0) throw new AppError(409, 'ROOM_IN_USE', '名下还有 ' + used + ' 条探头或者批次，不能删除', { count: used });
+  const probesHere = data.probes.filter((p) => p.roomId === id).length;
+  const batchesHere = data.batches.filter((b) => coldlib.roomIdAt(data, b, store.nowText()) === id).length;
+  const changeRefs = (data.changes || []).filter((c) => c.fromRoomId === id || c.toRoomId === id).length;
+  const registeredHere = data.batches.filter((b) => b.roomId === id).length - batchesHere;
+  const used = probesHere + batchesHere + changeRefs + registeredHere;
+  if (used > 0) throw new AppError(409, 'ROOM_IN_USE', '还有 ' + used + ' 项探头、当前/历史批次或变更登记引用这个库位，不能删除', { count: used });
   data.rooms = data.rooms.filter((r) => r.id !== id);
   return { removed: id };
 }
@@ -192,26 +202,69 @@ function removeProbe(data, id) {
 function listBatches(data, query) {
   const q = query || {};
   let rows = data.batches.slice();
-  if (q.roomId) rows = rows.filter((b) => b.roomId === q.roomId);
+  if (q.roomId) rows = rows.filter((b) => coldlib.roomIdAt(data, b, store.nowText()) === q.roomId);
   if (q.status) rows = rows.filter((b) => b.status === q.status);
   if (q.product) rows = rows.filter((b) => String(b.product || '').includes(q.product));
   const decorated = rows.map((b) => decorateBatch(data, b));
   return decorated.sort((a, b) => (a.loadedAt < b.loadedAt ? 1 : -1));
 }
 
+function decorateChange(data, c) {
+  const roomName = (id) => {
+    const room = data.rooms.find((r) => r.id === id);
+    return room ? room.code + ' ' + room.name : '(已删除库位 ' + id + ')';
+  };
+  const batch = data.batches.find((b) => b.id === c.batchId);
+  return Object.assign({}, c, {
+    fromRoomCode: roomName(c.fromRoomId),
+    toRoomCode: roomName(c.toRoomId),
+    batchCode: batch ? batch.code : '',
+    batchStatus: batch ? batch.status : '',
+  });
+}
+
 function batchDetail(data, id) {
   const batch = data.batches.find((b) => b.id === id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
-  const rows = coldlib.recordsOfBatch(data, id).map((r) => Object.assign({}, r, {
-    probeCode: probeCode(data, r.probeId),
-    probeExpired: !coldlib.probeValidOn(coldlib.probeOf(data, r.probeId), String(r.at).slice(0, 10)),
-  }));
+  const timelineData = coldlib.locationTimeline(data, batch);
+  const rows = coldlib.recordsOfBatch(data, id).map((r) => {
+    const segIdx = coldlib.segmentIndexAt(timelineData.segments, r.at);
+    const seg = timelineData.segments[segIdx];
+    const room = data.rooms.find((x) => x.id === seg.roomId);
+    return Object.assign({}, r, {
+      probeCode: probeCode(data, r.probeId),
+      segmentIndex: segIdx,
+      roomId: seg.roomId,
+      roomCode: room ? room.code : '',
+      probeExpired: !coldlib.probeValidOn(coldlib.probeOf(data, r.probeId), String(r.at).slice(0, 10)),
+    });
+  });
+  const analysis = coldlib.segmentedAnalysis(data, batch);
+  // 每次放行当时采用的是哪个库位段、哪一段的数据：按放行单冻结的 dataScope 标注，缺快照的老单据回退推断
+  const releases = data.releases.filter((r) => r.batchId === id).slice().sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1)).map((r) => {
+    let scopeSegments = [];
+    if (r.dataScope && Array.isArray(r.dataScope.segmentIndexes)) {
+      scopeSegments = r.dataScope.segmentIndexes.slice();
+    } else {
+      scopeSegments = analysis.segments.filter((s) => String(s.startAt) <= String(r.decidedAt)).map((s) => s.index);
+    }
+    return Object.assign({}, r, {
+      scopeSegmentIndexes: scopeSegments,
+      scopeRooms: scopeSegments.map((i) => (analysis.segments[i] || {}).roomCode).filter(Boolean),
+      scopeAsOf: r.dataScope ? r.dataScope.asOf : r.decidedAt,
+      scopeRecordCount: r.dataScope ? r.dataScope.recordCount : null,
+      hasDataScope: !!(r.dataScope && Array.isArray(r.dataScope.segmentIndexes)),
+    });
+  });
   return Object.assign({}, decorateBatch(data, batch), {
     records: rows,
     effectiveRecords: coldlib.effectiveRecords(data, id).map((r) => Object.assign({}, r, { probeCode: probeCode(data, r.probeId) })),
     segments: coldlib.excursionStats(data, id).segments,
     chainGaps: coldlib.chainGaps(data, id).gaps,
-    releases: data.releases.filter((r) => r.batchId === id).slice().sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1)),
+    changes: timelineData.changes.map((c) => decorateChange(data, c)),
+    locationSegments: analysis.segments,
+    boundaryGaps: analysis.boundaryGaps,
+    releases,
   });
 }
 
@@ -249,13 +302,20 @@ function createBatch(data, payload) {
 function updateBatch(data, id, payload) {
   const batch = data.batches.find((b) => b.id === id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  // 库位不能用批次修改接口静默改：换冷库/车厢必须走"库位变更登记"，否则早先记录的归属就乱了
+  if (payload && Object.prototype.hasOwnProperty.call(payload, 'roomId') && payload.roomId !== batch.roomId) {
+    const currentRoomId = coldlib.roomIdAt(data, batch, store.nowText());
+    if (payload.roomId !== currentRoomId) {
+      throw new AppError(409, 'ROOM_CHANGE_MUST_BE_REGISTERED', '换冷库或者车厢要走"库位变更登记"，不能直接改批次的所在冷库', { field: 'roomId' });
+    }
+  }
   validateBatch(data, payload, batch);
   const merged = Object.assign({}, batch, payload);
   Object.assign(batch, {
     product: String(merged.product).trim(),
     spec: String(merged.spec || '').trim(),
     units: Number(merged.units),
-    roomId: merged.roomId,
+    roomId: batch.roomId,
     loadedAt: String(merged.loadedAt),
     supplier: String(merged.supplier || '').trim(),
     status: merged.status,
@@ -271,6 +331,7 @@ function removeBatch(data, id) {
   const used = data.records.filter((r) => r.batchId === id).length;
   data.records = data.records.filter((r) => r.batchId !== id);
   data.releases = data.releases.filter((r) => r.batchId !== id);
+  data.changes = (data.changes || []).filter((c) => c.batchId !== id);
   data.batches = data.batches.filter((b) => b.id !== id);
   return { removed: id, removedRecords: used };
 }
@@ -284,11 +345,23 @@ function listRecords(data, query) {
   if (q.from) rows = rows.filter((r) => r.at >= q.from);
   if (q.to) rows = rows.filter((r) => r.at <= q.to);
   return rows
-    .map((r) => Object.assign({}, r, {
-      batchCode: batchCode(data, r.batchId),
-      probeCode: probeCode(data, r.probeId),
-      outOfRange: Number(r.temperatureC) > Number(data.settings.upperLimitC) || Number(r.temperatureC) < Number(data.settings.lowerLimitC),
-    }))
+    .map((r) => {
+      const batch = data.batches.find((b) => b.id === r.batchId);
+      let roomCode = '';
+      if (batch) {
+        const tl = coldlib.locationTimeline(data, batch);
+        roomCode = (function () {
+          const room = data.rooms.find((x) => x.id === tl.segments[coldlib.segmentIndexAt(tl.segments, r.at)].roomId);
+          return room ? room.code : '';
+        })();
+      }
+      return Object.assign({}, r, {
+        batchCode: batchCode(data, r.batchId),
+        probeCode: probeCode(data, r.probeId),
+        roomCode,
+        outOfRange: Number(r.temperatureC) > Number(data.settings.upperLimitC) || Number(r.temperatureC) < Number(data.settings.lowerLimitC),
+      });
+    })
     .sort((a, b) => (a.at < b.at ? 1 : -1));
 }
 
@@ -333,12 +406,24 @@ function listReleases(data, query) {
   let rows = data.releases.slice();
   if (q.batchId) rows = rows.filter((r) => r.batchId === q.batchId);
   if (q.decision) rows = rows.filter((r) => r.decision === q.decision);
+  const roomName = (id) => {
+    const room = data.rooms.find((r) => r.id === id);
+    return room ? room.code : '';
+  };
   return rows
-    .map((r) => Object.assign({}, r, { batchCode: batchCode(data, r.batchId) }))
+    .map((r) => Object.assign({}, r, {
+      batchCode: batchCode(data, r.batchId),
+      scopeRooms: r.dataScope && Array.isArray(r.dataScope.segmentRooms)
+        ? r.dataScope.segmentRooms.map(roomName).filter(Boolean)
+        : [],
+      scopeRecordCount: r.dataScope ? r.dataScope.recordCount : null,
+      hasDataScope: !!r.dataScope,
+    }))
     .sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1));
 }
 
-// 放行：登记放行单并改批次状态
+// 放行：登记放行单并改批次状态；同时冻结当时判定所用的数据段（哪些库位段、截至时刻），
+// 以后再登记库位变更，过去的放行结论也不按新归属重新解释
 function decide(data, batchId, payload) {
   const batch = data.batches.find((b) => b.id === batchId);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
@@ -348,17 +433,28 @@ function decide(data, batchId, payload) {
   if (!String(payload.decider || '').trim()) {
     throw new AppError(400, 'VALIDATION_FAILED', '经办人要填', { decider: '经办人不能为空' });
   }
-  const check = coldlib.releaseCheck(data, batch);
+  const decidedAt = String(payload.decidedAt || store.nowText());
+  const check = coldlib.releaseCheckAt(data, batch, decidedAt);
+  const timeline = coldlib.locationTimeline(data, batch);
+  const segmentIndexes = [];
+  timeline.segments.forEach((s) => { if (String(s.startAt) <= decidedAt) segmentIndexes.push(s.index); });
   const release = {
     id: store.nextId('rl', data.releases),
     batchId: batch.id,
     decision: payload.decision,
-    decidedAt: String(payload.decidedAt || store.nowText()),
+    decidedAt,
     decider: String(payload.decider).trim(),
     mkt: check.mkt,
     longestExcursionMinutes: check.longestMinutes,
     totalExcursionMinutes: check.totalMinutes,
     chainGapCount: check.chain.gapCount,
+    dataScope: {
+      asOf: decidedAt,
+      segmentIndexes,
+      segmentRooms: segmentIndexes.map((i) => timeline.segments[i].roomId),
+      recordCount: check.recordCount,
+      boundaryRule: '记录时刻 <= 判定时刻的记录参与判定；记录时刻恰为变更时刻的，归变更后（新库位）那一段',
+    },
     basis: String(payload.basis || '').trim(),
     remark: String(payload.remark || ''),
   };
@@ -368,11 +464,185 @@ function decide(data, batchId, payload) {
   return { release, batch: decorateBatch(data, batch) };
 }
 
+/* ---------- 库位变更登记 ---------- */
+
+const TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+
+function listChanges(data, query) {
+  const q = query || {};
+  let rows = (data.changes || []).slice();
+  if (q.batchId) rows = rows.filter((c) => c.batchId === q.batchId);
+  if (q.roomId) rows = rows.filter((c) => c.fromRoomId === q.roomId || c.toRoomId === q.roomId);
+  if (q.affected) rows = rows.filter((c) => Array.isArray(c.impact) && c.impact.some((x) => x.conclusionChanged));
+  return rows.map((c) => decorateChange(data, c)).sort((a, b) => (a.changedAt < b.changedAt ? 1 : a.changedAt > b.changedAt ? -1 : a.id < b.id ? 1 : -1));
+}
+
+// 判定结论快照（用于变更前后对照）
+function checkSummary(check) {
+  return {
+    pass: check.pass,
+    failed: check.failed.slice(),
+    recordCount: check.recordCount,
+    longestMinutes: check.longestMinutes,
+    totalMinutes: check.totalMinutes,
+    gapCount: check.chain.gapCount,
+    mkt: check.mkt,
+    expiredProbeCount: check.expiredProbes.length,
+  };
+}
+
+function segSummary(seg) {
+  return {
+    index: seg.index,
+    roomCode: seg.roomCode,
+    startAt: seg.startAt,
+    endAt: seg.endAt,
+    recordCount: seg.recordCount,
+    longestMinutes: seg.longestMinutes,
+    totalMinutes: seg.totalMinutes,
+    gapCount: seg.gapCount,
+    mkt: seg.mkt,
+    expiredProbeCount: seg.expiredProbes.length,
+    pass: seg.pass,
+    hasData: seg.hasData,
+    failed: seg.failed.slice(),
+  };
+}
+
+function registerChange(data, batchId, payload) {
+  const batch = data.batches.find((b) => b.id === batchId);
+  if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  const errors = {};
+  const timeline = coldlib.locationTimeline(data, batch);
+  const changedAt = String(payload.changedAt || '');
+  // 允许补登记历史变更：起点库位按变更时刻在既有时间线上的实际库位推断（时刻等于已有变更时归变更后库位）
+  const fromRoomId = timeline.segments[coldlib.segmentIndexAt(timeline.segments, changedAt || batch.loadedAt)].roomId;
+  if (!data.rooms.some((r) => r.id === payload.toRoomId)) errors.toRoomId = '目标冷库或者车厢不存在';
+  if (payload.toRoomId === fromRoomId) errors.toRoomId = '目标库位和该时刻所在库位一样，不用登记变更';
+  if (!TIME_RE.test(changedAt)) errors.changedAt = '变更时刻格式要像 2026-09-13 08:00:00';
+  if (!String(payload.operator || '').trim()) errors.operator = '经办人不能为空';
+  if (!String(payload.reason || '').trim()) errors.reason = '变更原因不能为空';
+  if (!errors.changedAt && changedAt <= String(batch.loadedAt)) errors.changedAt = '变更时刻要晚于入库时刻 ' + batch.loadedAt;
+  if (!errors.changedAt && timeline.changes.some((c) => String(c.changedAt) === changedAt)) errors.changedAt = '这个时刻已经登记过一次变更，同一时刻不能登记两次';
+  if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '变更登记没通过校验', errors);
+
+  // 冻结变更前的分段判定（截至变更时刻），再写入变更、算变更后的分段，逐段对照
+  const beforeAnalysis = coldlib.segmentedAnalysis(data, batch, changedAt);
+  const beforeWhole = checkSummary(coldlib.releaseCheckAt(data, batch, changedAt));
+  const releasedBefore = data.releases.filter((r) => r.batchId === batch.id && String(r.decidedAt) <= changedAt);
+
+  const change = {
+    id: store.nextId('ch', data.changes || []),
+    batchId: batch.id,
+    fromRoomId,
+    toRoomId: payload.toRoomId,
+    changedAt,
+    registeredAt: store.nowText(),
+    retroactive: changedAt < store.nowText(),
+    reason: String(payload.reason).trim(),
+    operator: String(payload.operator).trim(),
+    remark: String(payload.remark || '').trim(),
+  };  data.changes.push(change);
+
+  const afterAnalysis = coldlib.segmentedAnalysis(data, batch, changedAt);
+  const afterWhole = checkSummary(coldlib.releaseCheckAt(data, batch, changedAt));
+
+  // 另一套对照：按登记时已有的全部记录（不限时刻），变更前旧归属 vs 变更后新归属的完整时间线
+  const beforeFullAnalysis = coldlib.segmentedAnalysisForChanges(data, batch, timeline.changes, null);
+  const afterFullAnalysis = coldlib.segmentedAnalysis(data, batch, null);
+  // 批次整体（全段合并）的记录集不随归属改变，整体指标相同；真正变化的是记录落在哪一段
+  const beforeFullWhole = checkSummary(coldlib.releaseCheck(data, batch));
+  const afterFullWhole = checkSummary(coldlib.releaseCheck(data, batch));
+
+  const buildSegDiffs = (beforeSegs, afterSegs) => {
+    const segKey = (s) => s.roomId + '@' + s.startAt;
+    const beforeMap = {};
+    beforeSegs.forEach((s) => { beforeMap[segKey(s)] = s; });
+    const diffs = [];
+    afterSegs.forEach((b) => {
+      const a = beforeMap[segKey(b)] || null;
+      const bs = segSummary(b);
+      const as = a ? segSummary(a) : null;
+      const changed = !a
+        ? bs.recordCount > 0
+        : as.recordCount !== bs.recordCount ||
+          as.longestMinutes !== bs.longestMinutes ||
+          as.totalMinutes !== bs.totalMinutes ||
+          as.gapCount !== bs.gapCount ||
+          as.mkt !== bs.mkt ||
+          as.expiredProbeCount !== bs.expiredProbeCount ||
+          as.pass !== bs.pass;
+      diffs.push({ before: as, after: bs, changed, splitOut: !a });
+    });
+    const afterKeys = {};
+    afterSegs.forEach((s) => { afterKeys[segKey(s)] = true; });
+    beforeSegs.forEach((a) => {
+      if (!afterKeys[segKey(a)]) diffs.push({ before: segSummary(a), after: null, changed: true, splitOut: false });
+    });
+    return diffs;
+  };
+
+  // 边界时刻对照（记录只取到变更时刻）
+  const segDiffsAtBoundary = buildSegDiffs(beforeAnalysis.segments, afterAnalysis.segments);
+  // 全量记录对照（登记时已存在的所有记录在两套归属下怎么落段）
+  const segDiffs = buildSegDiffs(beforeFullAnalysis.segments, afterFullAnalysis.segments);
+
+  const buildMetric = (b, a) => {
+    const out = [];
+    const addMetric = (metric, x, y) => { if (x !== y) out.push({ metric, before: x, after: y }); };
+    addMetric('参与判定记录条数', b.recordCount, a.recordCount);
+    addMetric('最长超限(分)', b.longestMinutes, a.longestMinutes);
+    addMetric('累计超限(分)', b.totalMinutes, a.totalMinutes);
+    addMetric('断链处数', b.gapCount, a.gapCount);
+    addMetric('MKT(℃)', b.mkt, a.mkt);
+    addMetric('过期探头数', b.expiredProbeCount, a.expiredProbeCount);
+    return out;
+  };
+  const metricChanges = buildMetric(beforeFullWhole, afterFullWhole);
+
+  const affectedSegments = segDiffs.filter((d) => d.changed);
+  const conclusionChanged = affectedSegments.length > 0;
+
+  change.impact = [{
+    asOf: changedAt,
+    boundaryRule: '记录时刻早于变更时刻归变更前库位；记录时刻与变更时刻相同归变更后（新库位）',
+    whole: { before: beforeWhole, after: afterWhole, metricChanges: buildMetric(beforeWhole, afterWhole) },
+    wholeFull: { before: beforeFullWhole, after: afterFullWhole, metricChanges },
+    // 截至变更时刻的边界对照
+    segments: segDiffsAtBoundary,
+    // 按登记时全部已有记录的归属对照（决定"哪些结论变了"）
+    segmentsFull: segDiffs,
+    conclusionChanged,
+    affectedSegmentCount: affectedSegments.length,
+    releasedBefore: releasedBefore.map((r) => ({ id: r.id, decision: r.decision, decidedAt: r.decidedAt, keptFrozen: true })),
+  }];
+  change.currentConclusion = {
+    pass: coldlib.releaseCheck(data, batch).pass,
+    openBatch: batch.status === '在库' || batch.status === '待放行',
+    batchStatus: batch.status,
+  };
+
+  return {
+    change: decorateChange(data, change),
+    beforeSegments: beforeAnalysis.segments.map(segSummary),
+    afterSegments: afterAnalysis.segments.map(segSummary),
+    segDiffs,
+    whole: { before: beforeWhole, after: afterWhole, metricChanges },
+    conclusionChanged,
+    affectedSegmentCount: affectedSegments.length,
+    locationSegments: coldlib.segmentedAnalysis(data, batch).segments,
+    warning: releasedBefore.length
+      ? '该批次在变更前已有 ' + releasedBefore.length + ' 份放行/拒收单，单据结论与所用数据段保持当时口径冻结，本次变更不重算过去的结论'
+      : '',
+  };
+}
+
 module.exports = {
   listRooms, roomDetail, createRoom, updateRoom, removeRoom,
   listProbes, createProbe, updateProbe, removeProbe,
   listBatches, batchDetail, createBatch, updateBatch, removeBatch,
   listRecords, createRecord, removeRecord,
   listReleases, decide,
+  listChanges, registerChange, decorateChange,
   ROOM_STATUS, ROOM_TYPE, PROBE_STATUS, BATCH_STATUS, SOURCE_LIST,
 };

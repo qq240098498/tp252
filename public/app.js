@@ -20,17 +20,20 @@ const state = {
   batchesView: [],
   recordsView: [],
   releasesView: [],
+  changesView: [],
   roomDetail: {},
   batchDetail: {},
   batchOut: {},
   batchDetailError: {},
   expandedRooms: new Set(),
   expandedBatches: new Set(),
+  expandedChanges: new Set(),
   filters: {
     rooms: { status: '', type: '', keyword: '', probeStatus: '', probeCal: 'all' },
     batches: { status: '', roomId: '', product: '', noRecord: false },
     records: { batchId: '', probeId: '', source: '', from: '', to: '' },
-    releases: { decision: '' }
+    releases: { decision: '' },
+    changes: { batchId: '', affected: '' }
   }
 };
 
@@ -184,6 +187,7 @@ async function loadView(view) {
     else if (view === 'batches') await loadBatchesView();
     else if (view === 'records') await loadRecordsView();
     else if (view === 'releases') await loadReleasesView();
+    else if (view === 'changes') await loadChangesView();
   } catch (err) { showError(err); }
 }
 
@@ -214,6 +218,7 @@ function renderOverview() {
     { title: '放行 / 拒收', value: s.releasedCount + ' / ' + s.rejectedCount, sub: '台账 ' + s.releaseCount + ' 条', go: { view: 'releases' } },
     { title: '满足放行条件', value: s.readyToRelease, sub: '被挡下 ' + s.blockedCount, go: { view: 'batches' } },
     { title: '没有温度记录', value: s.noRecordBatches, sub: '个批次', go: { view: 'batches', noRecord: true } },
+    { title: '库位变更登记', value: s.changeCount, sub: '影响判定 ' + num(s.affectedChangeCount) + ' 次', go: { view: 'changes' } },
     { title: 'MKT', value: s.maxMkt, sub: '平均 ' + s.averageMkt, go: { view: 'batches' } }
   ];
   $('overviewCards').innerHTML = cards.map(function (c) {
@@ -369,16 +374,19 @@ function renderBatchRows() {
   const rows = state.batchesView || [];
   const tbody = $('batchRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="13" class="empty">没有符合条件的批次</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">没有符合条件的批次</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function (b) {
+    const changeCell = num(b.changeCount) > 0
+      ? '<button type="button" class="btn btn-sm" data-action="batch-jump-changes" data-id="' + esc(b.id) + '">' + num(b.changeCount) + ' 次</button>'
+      : '<span class="muted">—</span>';
     const main = '<tr class="row-main" data-rowkind="batch" data-id="' + esc(b.id) + '">' +
       '<td>' + esc(b.code) + '</td>' +
       '<td>' + esc(b.product) + '</td>' +
       '<td>' + esc(b.spec) + '</td>' +
       '<td class="num">' + num(b.units) + '</td>' +
-      '<td>' + esc(b.roomCode) + '</td>' +
+      '<td>' + esc(b.roomCode) + (num(b.changeCount) > 0 ? ' <span class="moved-mark" title="发生过库位变更">⇄</span>' : '') + '</td>' +
       '<td>' + esc(b.loadedAt) + '</td>' +
       '<td>' + esc(b.status) + '</td>' +
       '<td class="num">' + num(b.recordCount) + '</td>' +
@@ -386,6 +394,7 @@ function renderBatchRows() {
       '<td class="num">' + num(b.totalExcursionMinutes) + '</td>' +
       '<td class="num">' + num(b.mkt) + '</td>' +
       '<td class="num">' + num(b.chainGapCount) + '</td>' +
+      '<td class="num">' + changeCell + '</td>' +
       '<td>' + releaseSituation(b) + '</td>' +
       '</tr>';
     if (!state.expandedBatches.has(b.id)) return main;
@@ -395,27 +404,56 @@ function renderBatchRows() {
 
 function batchDetailRow(b) {
   const d = state.batchDetail[b.id];
-  if (!d) return '<tr class="row-detail"><td colspan="13"><div class="detail-note">正在读取批次详情…</div></td></tr>';
+  if (!d) return '<tr class="row-detail"><td colspan="14"><div class="detail-note">正在读取批次详情…</div></td></tr>';
   const out = state.batchOut[b.id] || {};
 
   const records = (d.records || []).map(function (r) {
     const oor = out[r.id];
-    return '<tr><td>' + esc(r.at) + '</td><td>' + esc(r.probeCode) + '</td><td class="num">' + num(r.temperatureC) + '</td>' +
+    return '<tr><td>' + esc(r.at) + '</td><td>' + esc(r.roomCode || '') + '</td><td>' + esc(r.probeCode) + '</td><td class="num">' + num(r.temperatureC) + '</td>' +
       '<td>' + esc(r.source) + '</td>' +
       '<td>' + (oor ? pill('超限', 'pill-bad') : pill('正常', 'pill-mute')) + '</td>' +
       '<td>' + (r.probeExpired ? pill('已过期', 'pill-bad') : pill('有效', 'pill-mute')) + '</td></tr>';
-  }).join('') || '<tr><td colspan="6" class="empty">没有温度记录</td></tr>';
+  }).join('') || '<tr><td colspan="7" class="empty">没有温度记录</td></tr>';
+
+  /* 各库位段：记录条数、最长/累计超限、断链、MKT、四条判定 */
+  const segs = d.locationSegments || [];
+  const segRows = segs.map(function (s) {
+    const conds = (s.conditions || []).map(function (c) {
+      return '<span class="seg-cond ' + (c.ok ? 'seg-cond-ok' : 'seg-cond-bad') + '" title="' + esc(c.text) + '（实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '）">' +
+        (c.ok ? '✓' : '✗') + '</span>';
+    }).join(' ');
+    return '<tr' + (s.index === segs.length - 1 ? ' class="seg-current"' : '') + '>' +
+      '<td>#' + num(s.index) + (s.index === segs.length - 1 ? ' ' + pill('当前', 'pill-ok') : '') + '</td>' +
+      '<td>' + esc(s.roomCode) + '</td>' +
+      '<td>' + esc(s.startAt) + '<br><span class="muted">' + (s.ongoing ? '至今' : esc(s.endAt || '')) + '</span></td>' +
+      '<td class="num">' + num(s.recordCount) + '</td>' +
+      '<td class="num">' + num(s.longestMinutes) + '</td>' +
+      '<td class="num">' + num(s.totalMinutes) + '</td>' +
+      '<td class="num">' + num(s.gapCount) + '</td>' +
+      '<td class="num">' + (s.hasData ? num(s.mkt) : '—') + '</td>' +
+      '<td>' + (s.hasData ? conds : '<span class="muted">无记录</span>') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="9" class="empty">没有库位段</td></tr>';
+
+  /* 跨段转移缺口（搬运/换车厢期间监控中断） */
+  const bGaps = d.boundaryGaps || [];
+  const boundaryHtml = bGaps.length
+    ? '<h4>转移缺口（' + bGaps.length + '）</h4><table class="mini-table"><thead><tr><th>从库位</th><th>到库位</th><th>起</th><th>止</th><th class="num">中断(分)</th></tr></thead><tbody>' +
+      bGaps.map(function (g) {
+        return '<tr class="row-danger"><td>' + esc(g.fromRoomCode) + '</td><td>' + esc(g.toRoomCode) + '</td><td>' + esc(g.from) + '</td><td>' + esc(g.to) + '</td><td class="num">' + num(g.minutes) + '</td></tr>';
+      }).join('') + '</tbody></table>'
+    : '';
 
   let segmentsHtml;
   if (d.segmentsUnavailable) {
     const emsg = (state.batchDetailError[b.id] && state.batchDetailError[b.id].message) || '批次详情接口报错';
     segmentsHtml = '<div class="detail-note">读不到超限段：' + esc(emsg) + '（服务端 /api/batches/:id 报错，已退回其他接口）</div>';
   } else {
-    const segRows = (d.segments || []).map(function (s) {
+    const segRows2 = (d.segments || []).map(function (s) {
       return '<tr><td>' + esc(s.startAt) + '</td><td>' + esc(s.endAt) + '</td><td class="num">' + num(s.minutes) + '</td>' +
         '<td class="num">' + num(s.peakC) + '</td><td class="num">' + num(s.points) + '</td></tr>';
     }).join('') || '<tr><td colspan="5" class="empty">没有超限段</td></tr>';
-    segmentsHtml = '<table class="mini-table"><thead><tr><th>起</th><th>止</th><th class="num">时长(分)</th><th class="num">峰值(℃)</th><th class="num">点数</th></tr></thead><tbody>' + segRows + '</tbody></table>';
+    segmentsHtml = '<table class="mini-table"><thead><tr><th>起</th><th>止</th><th class="num">时长(分)</th><th class="num">峰值(℃)</th><th class="num">点数</th></tr></thead><tbody>' + segRows2 + '</tbody></table>';
   }
 
   const gaps = (d.chainGaps || []).map(function (g) {
@@ -426,7 +464,9 @@ function batchDetailRow(b) {
   const check = d.releaseCheck || {};
   const conds = (check.conditions || []).slice();
   const expired = check.expiredProbes || [];
-  conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
+  if (!conds.some(function (c) { return c.key === 'calibration'; })) {
+    conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
+  }
   const condHtml = conds.map(function (c) {
     return '<li><span class="cond-text">' + okPill(c.ok) + ' ' + esc(c.text) + '</span>' +
       '<span class="cond-meta">实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '</span></li>';
@@ -436,29 +476,56 @@ function batchDetailRow(b) {
     return '<tr><td>' + esc(p.probeCode) + '</td><td>' + esc(p.calibratedUntil) + '</td><td>' + esc(p.at) + '</td></tr>';
   }).join('') || '<tr><td colspan="3" class="empty">没有已过校准期的探头</td></tr>';
 
+  /* 变更历史 + 放行单所用数据段 */
+  const changes = d.changes || [];
+  const changesHtml = changes.length
+    ? '<table class="mini-table"><thead><tr><th>变更时刻</th><th>从</th><th>到</th><th>原因</th><th>经办人</th></tr></thead><tbody>' +
+      changes.map(function (c) {
+        return '<tr><td>' + esc(c.changedAt) + '</td><td>' + esc(c.fromRoomCode) + '</td><td>' + esc(c.toRoomCode) + '</td><td>' + esc(c.reason) + (c.remark ? '<br><span class="muted">' + esc(c.remark) + '</span>' : '') + '</td><td>' + esc(c.operator) + '</td></tr>';
+      }).join('') + '</tbody></table>'
+    : '<div class="detail-note">还没有库位变更登记</div>';
+
   const releases = (d.releases || []).map(function (r) {
-    return '<tr><td>' + esc(r.decision) + '</td><td>' + esc(r.decidedAt) + '</td><td>' + esc(r.decider) + '</td>' +
-      '<td class="num">' + num(r.mkt) + '</td><td>' + esc(r.basis) + '</td></tr>';
+    const scopeParts = (r.scopeRooms || []).join(' → ');
+    let scope = '';
+    if (scopeParts) {
+      const scopeText = r.hasDataScope
+        ? '判定用：' + esc(scopeParts) + ' 段，共 ' + num(r.scopeRecordCount) + ' 条，截至 ' + esc(r.scopeAsOf || r.decidedAt)
+        : '（旧单据，无快照；按现有时间线推断）' + esc(scopeParts) + ' 段';
+      scope = '<br><span class="muted">' + scopeText + '</span>';
+    }
+    return '<tr' + (r.hasDataScope ? '' : ' class="muted-row"') + '><td>' + esc(r.decision) + '</td><td>' + esc(r.decidedAt) + '</td><td>' + esc(r.decider) + '</td>' +
+      '<td class="num">' + num(r.mkt) + '</td><td>' + esc(r.basis) + scope + '</td></tr>';
   }).join('') || '<tr><td colspan="5" class="empty">没有放行记录</td></tr>';
+
+  const released = b.status === '已放行' || b.status === '已拒收';
+  const frozenNote = released && changes.length
+    ? '<div class="frozen-note">⚠ 该批次已' + esc(b.status) + '后又登记了 ' + changes.length + ' 次库位变更：上面的放行单仍按当时判定所用的数据段保留，不按新归属重新解释；变更前后的对照见「变更历史」标签。</div>'
+    : '';
 
   const decisionBtns = '<div class="detail-actions">' +
     '<button type="button" class="btn btn-primary" data-action="batch-release" data-id="' + esc(b.id) + '">放行</button>' +
     '<button type="button" class="btn" data-action="batch-reject" data-id="' + esc(b.id) + '">拒收</button>' +
+    '<button type="button" class="btn" data-action="batch-change" data-id="' + esc(b.id) + '">登记库位变更</button>' +
     '<button type="button" class="btn btn-danger" data-action="batch-del" data-id="' + esc(b.id) + '">删除</button>' +
     '</div>';
 
-  return '<tr class="row-detail"><td colspan="13">' +
+  return '<tr class="row-detail"><td colspan="14">' +
     '<div class="detail-grid">' +
+    '<div class="detail-block detail-block-wide"><h4>各库位段统计（' + segs.length + ' 段；按记录时刻归属，边界时刻归新库位）</h4>' +
+    '<table class="mini-table"><thead><tr><th>段</th><th>库位</th><th>起止</th><th class="num">记录条数</th><th class="num">最长超限(分)</th><th class="num">累计超限(分)</th><th class="num">断链处数</th><th class="num">MKT</th><th>四条判定</th></tr></thead><tbody>' + segRows + '</tbody></table>' +
+    boundaryHtml + frozenNote + '</div>' +
     '<div class="detail-block"><h4>温度记录（' + (d.records || []).length + '）</h4>' +
-    '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
+    '<table class="mini-table"><thead><tr><th>时刻</th><th>归属库</th><th>探头</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
     '<div class="detail-block"><h4>超限段（' + (d.segments || []).length + '）</h4>' + segmentsHtml +
-    '<h4>断链缺口（' + (d.chainGaps || []).length + '）</h4>' +
+    '<h4>断链缺口（段内，' + (d.chainGaps || []).length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>起</th><th>止</th><th class="num">实际(分)</th><th class="num">计入(分)</th></tr></thead><tbody>' + gaps + '</tbody></table></div>' +
-    '<div class="detail-block"><h4>放行判定</h4><ul class="cond-list">' + condHtml + '</ul>' +
+    '<div class="detail-block"><h4>放行判定（全段合并口径）</h4><ul class="cond-list">' + condHtml + '</ul>' +
     '<h4>已过校准期的探头（' + expired.length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>探头</th><th>校准有效期</th><th>记录时刻</th></tr></thead><tbody>' + expiredProbes + '</tbody></table></div>' +
-    '<div class="detail-block"><h4>放行记录（' + (d.releases || []).length + '）</h4>' +
-    '<table class="mini-table"><thead><tr><th>决定</th><th>时刻</th><th>经办人</th><th class="num">MKT</th><th>依据</th></tr></thead><tbody>' + releases + '</tbody></table>' +
+    '<div class="detail-block"><h4>库位变更历史（' + changes.length + '）</h4>' + changesHtml +
+    '<h4>放行记录（' + (d.releases || []).length + '）</h4>' +
+    '<table class="mini-table"><thead><tr><th>决定</th><th>时刻</th><th>经办人</th><th class="num">MKT</th><th>依据 / 所用数据段</th></tr></thead><tbody>' + releases + '</tbody></table>' +
     decisionBtns + '</div>' +
     '</div></td></tr>';
 }
@@ -497,6 +564,9 @@ async function expandBatch(id) {
         segmentsUnavailable: true,
         chainGaps: (check.chain && check.chain.gaps) || [],
         releases: fallback[2] || [],
+        changes: [],
+        locationSegments: [],
+        boundaryGaps: [],
         releaseCheck: check,
         __fallback: true
       });
@@ -530,12 +600,13 @@ async function loadRecordsView() {
     : ('共 ' + rows.length + ' 条，已显示前 ' + Math.min(RECORD_PAGE, rows.length) + ' 条');
   const tbody = $('recordRows');
   if (!shown.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">没有符合条件的温度记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">没有符合条件的温度记录</td></tr>';
     return;
   }
   tbody.innerHTML = shown.map(function (r) {
     return '<tr class="row-main" data-rowkind="record" data-id="' + esc(r.id) + '">' +
       '<td>' + esc(r.batchCode) + '</td>' +
+      '<td>' + esc(r.roomCode || '') + '</td>' +
       '<td>' + esc(r.probeCode) + '</td>' +
       '<td>' + esc(r.at) + '</td>' +
       '<td class="num">' + num(r.temperatureC) + '</td>' +
@@ -570,10 +641,13 @@ async function loadReleasesView() {
   }
   const tbody = $('releaseRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有符合条件的放行记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">没有符合条件的放行记录</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function (r) {
+    const scope = r.hasDataScope
+      ? esc((r.scopeRooms || []).join(' → ')) + '<br><span class="muted">' + num(r.scopeRecordCount) + ' 条，截至 ' + esc(r.dataScope && r.dataScope.asOf || r.decidedAt) + '</span>'
+      : '<span class="muted">旧单据，无快照</span>';
     return '<tr class="row-main" data-rowkind="release" data-id="' + esc(r.id) + '">' +
       '<td>' + esc(r.batchCode) + '</td>' +
       '<td>' + (r.decision === '放行' ? pill('放行', 'pill-ok') : pill('拒收', 'pill-bad')) + '</td>' +
@@ -583,10 +657,95 @@ async function loadReleasesView() {
       '<td class="num">' + num(r.longestExcursionMinutes) + '</td>' +
       '<td class="num">' + num(r.totalExcursionMinutes) + '</td>' +
       '<td class="num">' + num(r.chainGapCount) + '</td>' +
+      '<td>' + scope + '</td>' +
       '<td>' + esc(r.basis) + '</td>' +
       '<td>' + esc(r.remark) + '</td>' +
       '</tr>';
   }).join('');
+}
+
+/* ---------- 库位变更历史 ---------- */
+
+async function loadChangesView() {
+  const f = state.filters.changes;
+  const params = new URLSearchParams();
+  if (f.batchId) params.set('batchId', f.batchId);
+  if (f.affected) params.set('affected', '1');
+  const rows = await api('GET', '/api/changes' + (params.toString() ? '?' + params.toString() : ''));
+  state.changesView = rows;
+  const affected = rows.filter(function (c) {
+    return (c.impact || []).some(function (x) { return x.conclusionChanged; });
+  }).length;
+  $('changesNote').textContent = '共 ' + rows.length + ' 次变更登记，其中 ' + affected + ' 次改变了分段判定结论；点一行展开变更前后对照。';
+  const tbody = $('changeRows');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">没有符合条件的变更登记</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (c) {
+    const isAffected = (c.impact || []).some(function (x) { return x.conclusionChanged; });
+    const main = '<tr class="row-main" data-rowkind="change" data-id="' + esc(c.id) + '">' +
+      '<td>' + esc(c.batchCode) + '</td>' +
+      '<td>' + esc(c.fromRoomCode) + '</td>' +
+      '<td>' + esc(c.toRoomCode) + '</td>' +
+      '<td>' + esc(c.changedAt) + '</td>' +
+      '<td>' + esc(c.registeredAt) + (c.retroactive ? ' <span class="muted">(补登记)</span>' : '') + '</td>' +
+      '<td>' + esc(c.reason) + (c.remark ? '<br><span class="muted">' + esc(c.remark) + '</span>' : '') + '</td>' +
+      '<td>' + esc(c.operator) + '</td>' +
+      '<td>' + esc(c.batchStatus) + '</td>' +
+      '<td>' + (isAffected ? pill('分段结论有变', 'pill-bad') : pill('仅归属变化', 'pill-mute')) + '</td>' +
+      '</tr>';
+    if (!state.expandedChanges.has(c.id)) return main;
+    return main + changeImpactRow(c);
+  }).join('');
+}
+
+function segMini(s) {
+  if (!s) return '<span class="muted">—</span>';
+  const cond = (s.failed || []).length
+    ? pill(s.pass ? '满足' : '不满足：' + s.failed.join('、'), s.pass ? 'pill-ok' : 'pill-bad')
+    : pill(s.pass ? '满足' : '不满足', s.pass ? 'pill-ok' : 'pill-bad');
+  return esc(s.roomCode) +
+    '：记录 ' + num(s.recordCount) +
+    '，最长 ' + num(s.longestMinutes) + ' 分' +
+    '，累计 ' + num(s.totalMinutes) + ' 分' +
+    '，断链 ' + num(s.gapCount) +
+    '，MKT ' + (s.hasData ? num(s.mkt) : '—') +
+    ' ' + cond;
+}
+
+function changeImpactRow(c) {
+  const impact = (c.impact || [])[0] || {};
+  const diffTable = function (diffs, emptyHint) {
+    const rowsHtml = diffs.map(function (d) {
+      return '<tr class="' + (d.changed ? 'row-danger' : '') + '"><td>' +
+        (d.before ? segMini(d.before) : '<span class="muted">（变更前无此段）</span>') + '</td><td>' +
+        (d.after ? segMini(d.after) : '<span class="muted">（变更后无此段）</span>') + '</td></tr>';
+    }).join('') || '<tr><td colspan="2" class="empty">' + emptyHint + '</td></tr>';
+    return '<table class="mini-table"><thead><tr><th>变更前归属</th><th>变更后归属</th></tr></thead><tbody>' + rowsHtml + '</tbody></table>';
+  };
+  const fullDiffs = impact.segmentsFull || [];
+  const boundaryDiffs = impact.segments || [];
+  const whole = impact.wholeFull || impact.whole || {};
+  const metricHtml = (whole.metricChanges || []).length
+    ? (whole.metricChanges || []).map(function (m) {
+      return '<li>' + esc(m.metric) + '：' + esc(m.before) + ' → ' + esc(m.after) + '</li>';
+    }).join('')
+    : '<li>批次整体（全段合并）的判定数字不变——变的是记录落在哪一段、各段的超限与断链归属</li>';
+  const releasedHtml = (impact.releasedBefore || []).length
+    ? '<div class="frozen-note">⚠ 变更前已有放行/拒收单 ' + (impact.releasedBefore || []).map(function (r) {
+      return esc(r.decision + ' ' + r.decidedAt);
+    }).join('、') + '；这些单据的结论按当时数据段冻结，不因本次变更重算。</div>'
+    : '';
+  return '<tr class="row-detail"><td colspan="9"><div class="detail-grid">' +
+    '<div class="detail-block detail-block-wide"><h4>变更前后对照 · 登记时已有的全部记录（' + num(impact.affectedSegmentCount) + ' 个段有变化）</h4>' +
+    diffTable(fullDiffs, '无分段数据') +
+    '<h4>边界时刻对照 · 仅截至 ' + esc(impact.asOf || c.changedAt) + ' 的记录</h4>' +
+    diffTable(boundaryDiffs, '边界时刻之前没有记录') +
+    '<div class="field-hint">边界口径：' + esc(impact.boundaryRule || '') + '。</div>' +
+    releasedHtml +
+    '<h4>整体指标对照</h4><ul class="cond-list">' + metricHtml + '</ul></div>' +
+    '</div></td></tr>';
 }
 
 /* ---------- 左侧筛选栏 ---------- */
@@ -640,6 +799,13 @@ function renderFilters() {
     const f = state.filters.releases;
     html = '<h3>台账筛选</h3>' +
       '<div class="filter-field"><label>决定</label>' + selectHtml('decision', [{ value: '', label: '全部' }, { value: '放行', label: '放行' }, { value: '拒收', label: '拒收' }], f.decision) + '</div>';
+  } else if (v === 'changes') {
+    const f = state.filters.changes;
+    const batchSel = [{ value: '', label: '全部' }].concat(state.batches.map(function (b) { return { value: b.id, label: b.code }; }));
+    html = '<h3>变更筛选</h3>' +
+      '<div class="filter-field"><label>批次</label>' + selectHtml('batchId', batchSel, f.batchId) + '</div>' +
+      '<div class="filter-field"><label>只看影响判定</label>' + selectHtml('affected', [{ value: '', label: '全部' }, { value: '1', label: '分段结论有变' }], f.affected) + '</div>' +
+      '<div class="filter-hint">登记变更在批次详情里的「登记库位变更」按钮；已放行批次的变更不会重算过去的放行结论。</div>';
   }
   host.innerHTML = html;
 }
@@ -754,6 +920,58 @@ function openDecisionModal(batch, decision) {
       await refreshAfterMutation();
     } catch (err) { showError(err); }
   });
+}
+
+function openChangeForm(batch) {
+  const currentRoomId = batch.roomId;
+  const roomOpts = state.rooms
+    .filter(function (r) { return r.id !== currentRoomId; })
+    .map(function (r) { return '<option value="' + esc(r.id) + '">' + esc(r.code + ' ' + r.name) + '</option>'; })
+    .join('');
+  const released = batch.status === '已放行' || batch.status === '已拒收';
+  const now = state.summary && state.summary.today ? state.summary.today + ' 00:00:00' : '';
+  const body =
+    '<div class="field"><label>批次</label><div class="field-readonly">' + esc(batch.code + ' ' + batch.product) + '</div></div>' +
+    '<div class="field"><label>当前库位</label><div class="field-readonly">' + esc(batch.roomCode) + '</div></div>' +
+    '<div class="field"><label>转到哪个冷库 / 车厢</label><select data-field="toRoomId"><option value="">请选择目标库位</option>' + roomOpts + '</select></div>' +
+    '<div class="field"><label>变更时刻</label><input type="text" data-field="changedAt" value="' + esc(now) + '" placeholder="2026-09-13 08:00:00"><div class="field-hint">格式 2026-09-13 08:00:00；早于当前时刻按补登记处理</div></div>' +
+    '<div class="field"><label>变更原因</label><input type="text" data-field="reason" value="" placeholder="如：倒库 / 装车发运 / 设备故障换探头"></div>' +
+    '<div class="field"><label>经办人</label><input type="text" data-field="operator" value=""></div>' +
+    '<div class="field"><label>备注</label><textarea data-field="remark"></textarea></div>' +
+    (released ? '<div class="frozen-note">该批次已' + esc(batch.status) + '：可以补登记变更，但过去的放行/拒收结论按当时数据段冻结，不会被重算。</div>' : '');
+  openModal('登记库位 / 设备变更', body, '登记', async function () {
+    const v = formValues();
+    try {
+      const out = await api('POST', '/api/batches/' + encodeURIComponent(batch.id) + '/changes', {
+        toRoomId: v.toRoomId, changedAt: v.changedAt, reason: v.reason, operator: v.operator, remark: v.remark
+      });
+      closeModal();
+      openChangeResult(batch, out);
+      delete state.batchDetail[batch.id];
+      delete state.batchOut[batch.id];
+      await refreshAfterMutation();
+      state.expandedBatches.add(batch.id);
+      await expandBatch(batch.id);
+    } catch (err) { showError(err); }
+  });
+}
+
+function openChangeResult(batch, out) {
+  const diffs = (out.segDiffs || []).filter(function (d) { return d.changed; });
+  const rows = diffs.map(function (d) {
+    return '<li>' +
+      (d.before ? '【变更前】' + esc(d.before.roomCode) + ' 记录 ' + num(d.before.recordCount) + '、最长 ' + num(d.before.longestMinutes) + '、累计 ' + num(d.before.totalMinutes) + '、断链 ' + num(d.before.gapCount) : '') +
+      (d.before && d.after ? '<br>' : '') +
+      (d.after ? '【变更后】' + esc(d.after.roomCode) + ' 记录 ' + num(d.after.recordCount) + '、最长 ' + num(d.after.longestMinutes) + '、累计 ' + num(d.after.totalMinutes) + '、断链 ' + num(d.after.gapCount) : '') +
+      '</li>';
+  }).join('') || '<li>各库位段的记录条数、超限与断链数字没有变化</li>';
+  const body = '<div class="result-block">' +
+    '<div>批次 <b>' + esc(batch.code) + '</b> 已登记从 <b>' + esc(out.change.fromRoomCode) + '</b> 转到 <b>' + esc(out.change.toRoomCode) + '</b>（' + esc(out.change.changedAt) + '）。</div>' +
+    (out.warning ? '<div class="frozen-note">' + esc(out.warning) + '</div>' : '') +
+    '<h4>受影响的分段（' + num(out.affectedSegmentCount) + '）</h4><ul class="cond-list">' + rows + '</ul>' +
+    '<div class="field-hint">边界口径：记录时刻早于变更时刻归变更前库位，恰等于变更时刻归变更后（新库位）。</div>' +
+    '</div>';
+  openModal('变更已登记', body, '知道了', function () { closeModal(); });
 }
 
 function openRecordForm() {
@@ -876,6 +1094,16 @@ async function handleAction(action, el) {
       if (batch) openDecisionModal(batch, action === 'batch-release' ? '放行' : '拒收');
       return;
     }
+    if (action === 'batch-change') {
+      const batch = findBatch(el.dataset.id);
+      if (batch) openChangeForm(batch);
+      return;
+    }
+    if (action === 'batch-jump-changes') {
+      state.filters.changes.batchId = el.dataset.id || '';
+      await switchView('changes');
+      return;
+    }
     if (action === 'batch-del') {
       const id = el.dataset.id;
       armDelete(el, async function () {
@@ -912,6 +1140,11 @@ async function toggleExpand(kind, id) {
     if (kind === 'batch') {
       if (state.expandedBatches.has(id)) { state.expandedBatches.delete(id); renderBatchRows(); }
       else await expandBatch(id);
+      return;
+    }
+    if (kind === 'change') {
+      if (state.expandedChanges.has(id)) { state.expandedChanges.delete(id); loadChangesView(); }
+      else { state.expandedChanges.add(id); loadChangesView(); }
     }
   } catch (err) { showError(err); }
 }

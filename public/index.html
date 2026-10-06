@@ -26,6 +26,7 @@
     <button type="button" class="tab" data-view="batches">批次</button>
     <button type="button" class="tab" data-view="records">温度记录</button>
     <button type="button" class="tab" data-view="releases">放行台账</button>
+    <button type="button" class="tab" data-view="changes">变更历史</button>
   </nav>
 
   <main class="layout">
@@ -96,15 +97,15 @@
         <div class="panel">
           <div class="panel-head">
             <h2>批次清单</h2>
-            <span class="panel-hint">点一行展开温度记录、超限段、断链与放行判定</span>
+            <span class="panel-hint">点一行展开温度记录、各库位段统计、超限段、断链、放行判定与变更历史</span>
           </div>
           <div class="table-wrap">
             <table class="data-table">
               <thead>
                 <tr>
-                  <th>批次号</th><th>品名</th><th>规格</th><th class="num">件数</th><th>所在冷库</th>
+                  <th>批次号</th><th>品名</th><th>规格</th><th class="num">件数</th><th>当前库位</th>
                   <th>入库时刻</th><th>状态</th><th class="num">记录数</th><th class="num">最长超限</th>
-                  <th class="num">累计超限</th><th class="num">MKT</th><th class="num">断链数</th><th>放行情况</th>
+                  <th class="num">累计超限</th><th class="num">MKT</th><th class="num">断链数</th><th class="num">变更</th><th>放行情况</th>
                 </tr>
               </thead>
               <tbody id="batchRows"></tbody>
@@ -124,7 +125,7 @@
             <table class="data-table">
               <thead>
                 <tr>
-                  <th>批次</th><th>探头</th><th>时刻</th><th class="num">温度(℃)</th><th>来源</th>
+                  <th>批次</th><th>归属库位</th><th>探头</th><th>时刻</th><th class="num">温度(℃)</th><th>来源</th>
                   <th>登记人</th><th>是否超限</th><th>操作</th>
                 </tr>
               </thead>
@@ -146,12 +147,42 @@
                 <tr>
                   <th>批次</th><th>决定</th><th>时刻</th><th>经办人</th><th class="num">当时的 MKT</th>
                   <th class="num">最长超限</th><th class="num">累计超限</th><th class="num">断链数</th>
+                  <th>判定所用数据段</th>
                   <th>依据</th><th>备注</th>
                 </tr>
               </thead>
               <tbody id="releaseRows"></tbody>
             </table>
           </div>
+        </div>
+      </div>
+
+      <div class="view" data-view="changes" id="view-changes">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>库位 / 设备变更历史</h2>
+            <span class="panel-hint">批次从哪个冷库或车厢转到哪个、变更时刻、原因、经办人；点一行展开变更前后对照</span>
+          </div>
+          <div class="records-note" id="changesNote"></div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>批次</th><th>从</th><th>到</th><th>变更时刻</th><th>登记时刻</th>
+                  <th>原因</th><th>经办人</th><th>批次现状</th><th>对照</th>
+                </tr>
+              </thead>
+              <tbody id="changeRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>边界与放行口径</h2></div>
+          <ul class="rule-list">
+            <li>变更把批次切成若干<b>库位段</b>：每条温度记录按其记录时刻归属到当时所在的段；记录时刻<b>早于</b>变更时刻归变更前库位，记录时刻<b>恰等于</b>变更时刻归变更后（新库位）。</li>
+            <li>超限段、断链、MKT、四条放行判定按<b>每一段单独算</b>；跨变更边界的相邻两条记录不算段内断链，单独记为"转移缺口"列在批次详情。</li>
+            <li>放行或拒收时冻结当时判定所用的数据段与截至时刻；放行之后再登记变更，过去的结论<b>不按新归属重算</b>，放行台账会标明当时用的是哪一段的数据。</li>
+          </ul>
         </div>
       </div>
     </section>
